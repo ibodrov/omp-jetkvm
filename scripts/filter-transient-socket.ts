@@ -9,7 +9,11 @@
  */
 type Handler = (...args: unknown[]) => void;
 type LooseOn = (ev: string, fn: Handler, ...rest: unknown[]) => unknown;
-const origOn: LooseOn = (ev, fn, ...rest) => Reflect.apply(process.on, process, [ev, fn, ...rest]);
+// Capture the real process.on BEFORE patching: resolving `process.on` at call
+// time would re-enter `patchedOn` forever (mutual tail recursion => omp hangs
+// at 100% CPU the moment it registers any signal handler).
+const realOn = process.on.bind(process);
+const origOn: LooseOn = (ev, fn, ...rest) => Reflect.apply(realOn, process, [ev, fn, ...rest]);
 Object.defineProperty(process, "on", {
   configurable: true,
   value: function patchedOn(this: typeof process, ev: string, fn: Handler, ...rest: unknown[]): unknown {
