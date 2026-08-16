@@ -7,7 +7,7 @@
 import type { BunFile } from "bun";
 import { existsSync, statSync } from "node:fs";
 import { basename } from "node:path";
-import { JetKvmError, humanBytes, pickLanIp } from "./util.ts";
+import { JetKvmError, humanBytes, routeSourceAddress } from "./util.ts";
 import type { DeviceSession } from "./connection.ts";
 import type { PolicyConfig } from "./config.ts";
 
@@ -29,8 +29,8 @@ function deviceCodeOf(err: unknown): number | undefined {
   return undefined;
 }
 
-function firmwareLacks(err: unknown, method: string): boolean {
-  return deviceCodeOf(err) === -32601 && err instanceof JetKvmError;
+function firmwareLacks(err: unknown): boolean {
+  return err instanceof JetKvmError && deviceCodeOf(err) === -32601;
 }
 
 export async function listFiles(session: DeviceSession): Promise<{ files: { filename: string; size: number; createdAt: string }[] }> {
@@ -94,13 +94,14 @@ export async function mountUrl(
   try {
     await session.call("mountWithHTTP", { url: opts.url, mode: opts.mode ?? "CDROM" }, { timeoutMs: MOUNT_TIMEOUT_MS });
   } catch (err) {
-    if (firmwareLacks(err, "mountWithHTTP")) {
+    if (firmwareLacks(err)) {
       throw new JetKvmError("FirmwareLacksMethod", `device firmware lacks mountWithHTTP (${String(err)})`);
     }
     throw err;
   }
   return { check };
 }
+
 
 export async function mountFile(
   session: DeviceSession,
@@ -271,14 +272,21 @@ export async function serveAndMount(
     throw new JetKvmError("FileNotFound", `no such file: ${path}`);
   }
   const size = statSync(path).size;
-  const lanIp = pickLanIp();
-  if (!lanIp) {
-    throw new JetKvmError("NoLanAddress", "no non-internal IPv4 address found to advertise to the device");
+  // Bind + advertise on the interface that actually faces the device: the
+  // kernel's chosen source address for the route to it (multi-homed, VPN and
+  // loopback-test setups all resolve correctly; no packets sent). Anything
+  // else is a guess the device may not be able to route back to.
+  const bindIp = await routeSourceAddress(session.auth.hostname);
+  if (!bindIp) {
+    throw new JetKvmError(
+      "NoRouteToDevice",
+      `no usable local address on the route to ${session.auth.hostname} — cannot serve virtual media; check connectivity or use upload_and_mount instead`,
+    );
   }
   stopServeServer(session);
   const file: BunFile = Bun.file(path);
   const server = Bun.serve({
-    hostname: "0.0.0.0",
+    hostname: bindIp,
     port: 0,
     idleTimeout: 255,
     async fetch(req) {
@@ -316,7 +324,7 @@ export async function serveAndMount(
       });
     },
   });
-  const url = `http://${lanIp}:${server.port}/iso`;
+  const url = `http://${bindIp}:${server.port}/iso`;
   serveRegistry().set(session.auth.hostname, { server, url, since: Date.now() });
   try {
     const { check } = await mountUrl(session, policy, { url, mode: opts.mode });

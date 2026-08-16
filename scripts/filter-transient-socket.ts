@@ -8,7 +8,8 @@
  * omp from.
  */
 type Handler = (...args: unknown[]) => void;
-const origOn = process.on.bind(process);
+type LooseOn = (ev: string, fn: Handler, ...rest: unknown[]) => unknown;
+const origOn: LooseOn = (ev, fn, ...rest) => Reflect.apply(process.on, process, [ev, fn, ...rest]);
 Object.defineProperty(process, "on", {
   configurable: true,
   value: function patchedOn(this: typeof process, ev: string, fn: Handler, ...rest: unknown[]): unknown {

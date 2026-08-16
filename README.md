@@ -42,7 +42,6 @@ jetkvm:
     maxModelWidth: 1024
   policy:
     allowPowerActions: true
-    allowReboot: false
     allowUsbDisconnect: false
     forceUnmountOnMount: true
 ```
@@ -60,6 +59,15 @@ Full schema and design rationale: `DESIGN.md`.
 - Cross-process claim (abstract-socket on Linux) so two omp sessions on one machine don't both drive HID; `force: true` overrides a stale claim, `concurrency.crossProcess: none` disables.
 - Input never auto-retries across reconnects (replay danger). Any abort/error mid-transaction releases all held keys/buttons.
 - The device has no input interlock: a human at the local UI (or another machine) can inject concurrently; the tools surface "foreign input suspected" warnings when detectable.
+
+### serve_and_mount networking
+
+The local HTTP server binds and advertises the kernel's source address for
+the route to the device (the interface that actually faces it — correct on
+multi-homed hosts, VPN-routed devices, and loopback test setups). It is not
+device-authenticated: other hosts on that subnet can read the served image
+while the mount is active. Use `upload_and_mount` for sensitive media, or
+scope exposure with firewall rules.
 
 ## Firmware quirks observed (0.5.8)
 

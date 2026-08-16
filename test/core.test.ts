@@ -1,10 +1,11 @@
-import { AsyncMutex } from "../src/concurrency.ts";
+import { acquireCrossProcessClaim, AsyncMutex, holderIsLive, peekCrossProcessClaim } from "../src/concurrency.ts";
 import { JetKvmError } from "../src/util.ts";
 import { describe, expect, test } from "bun:test";
 import { parseRange } from "../src/storage.ts";
 import { policyGate } from "../src/intercept.ts";
 import { loadJetKvmConfig, resetConfigCache, resolveDevice, splitOrigin } from "../src/config.ts";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { writeScreenshotFile } from "../src/screenshot/engine.ts";
 describe("AsyncMutex", () => {
   test("serializes holders", async () => {
     const m = new AsyncMutex("input", 1_000);
@@ -68,7 +69,7 @@ describe("parseRange (serve_and_mount)", () => {
 });
 
 describe("policyGate (intercept)", () => {
-  const policy = { allowPowerActions: true, allowReboot: false, allowUsbDisconnect: false, forceUnmountOnMount: true };
+  const policy = { allowPowerActions: true, allowUsbDisconnect: false, forceUnmountOnMount: true };
 
   test("non-jetkvm tools pass untouched", () => {
     expect(policyGate(policy, { toolName: "bash", input: {} })).toBeUndefined();
@@ -105,7 +106,7 @@ describe("config", () => {
     expect(cfg.devices["lab"]?.host).toBe("10.0.0.9");
     expect(cfg.session.rpcTimeoutMs).toBe(2500);
     expect(cfg.session.idleTimeoutMs).toBe(600_000);
-    expect(cfg.policy.allowReboot).toBe(false);
+    expect(cfg.policy.forceUnmountOnMount).toBe(true);
     expect(cfg.concurrency.crossProcess).toBe("lock");
     const dev = resolveDevice(cfg, "lab");
     expect(dev.host).toBe("10.0.0.9");
@@ -140,5 +141,28 @@ describe("JetKvmError shape", () => {
     expect(e.code).toBe("InputBusy");
     expect(e.details).toEqual({ holder: "x" });
     expect(e.name).toBe("JetKvmError");
+  });
+});
+
+describe("cross-process claim liveness (pid reuse)", () => {
+  test("a live claim is recognized via pid + start time", () => {
+    const claim = acquireCrossProcessClaim("claim-test.local", { enabled: true });
+    expect(holderIsLive(claim.info)).toBe(true);
+    claim.release();
+    expect(peekCrossProcessClaim("claim-test.local")).toBeNull();
+  });
+  test("same pid but wrong start time reads as dead (pid was recycled)", () => {
+    expect(holderIsLive({ pid: process.pid, since: 0, startTicks: 999_999_999 })).toBe(false);
+  });
+  test("no start time recorded falls back to plain pid liveness", () => {
+    expect(holderIsLive({ pid: process.pid, since: 0 })).toBe(true);
+    expect(holderIsLive({ pid: 4_000_000, since: 0 })).toBe(false);
+  });
+});
+
+describe("writeScreenshotFile", () => {
+  test("fails synchronously on an unwritable path (no deferred rejection)", () => {
+    // /dev/null/foo is ENOTDIR — the write must throw here, not after return.
+    expect(() => writeScreenshotFile("AAAA", "image/jpeg", "/dev/null/omp-jetkvm")).toThrow();
   });
 });

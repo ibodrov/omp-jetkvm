@@ -38,7 +38,6 @@ export interface ConcurrencyConfig {
 
 export interface PolicyConfig {
   allowPowerActions: boolean;
-  allowReboot: boolean;
   allowUsbDisconnect: boolean;
   forceUnmountOnMount: boolean;
 }
@@ -65,7 +64,6 @@ const DEFAULTS: JetKvmConfig = {
   concurrency: { crossProcess: "lock", queueTimeoutMs: 5_000 },
   policy: {
     allowPowerActions: true,
-    allowReboot: false,
     allowUsbDisconnect: false,
     forceUnmountOnMount: true,
   },
@@ -85,20 +83,14 @@ function deepMerge<T>(base: T, overlay: unknown): T {
   return out as T;
 }
 
-interface ConfigSource {
-  path: string;
-  mtimeMs: number;
-}
-
-const SOURCES: ConfigSource[] = [];
-let cached: { key: string; config: JetKvmConfig } | null = null;
-
 function candidatePaths(cwd: string): string[] {
   return [
     `${cwd}/.omp/config.yml`,
     `${expandTilde("~/.omp/agent/config.yml")}`,
   ];
 }
+
+let cached: { key: string; config: JetKvmConfig } | null = null;
 
 /**
  * Load the `jetkvm:` config key, merged user → project (project wins).
@@ -140,7 +132,6 @@ export function loadJetKvmConfig(cwd: string): JetKvmConfig {
 /** Reset the cache (tests). */
 export function resetConfigCache(): void {
   cached = null;
-  SOURCES.length = 0;
 }
 
 /** Resolve a device by name; `undefined` means "the default device". */

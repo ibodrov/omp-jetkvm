@@ -41,7 +41,6 @@ export interface VideoState {
 
 export class AuthState {
   private cookie: string | null = null;
-  private cookieExpiresAt = 0;
   private password: string | null = null;
   private passwordResolved = false;
   private lastRotationAt = 0;
@@ -56,9 +55,6 @@ export class AuthState {
     return splitOrigin(this.dev.host).hostname;
   }
 
-  get hasCookie(): boolean {
-    return this.cookie !== null && Date.now() < this.cookieExpiresAt;
-  }
 
   private ensurePassword(): string | null {
     if (this.passwordResolved) return this.password;
@@ -90,13 +86,10 @@ export class AuthState {
     const token = setCookies
       .map((c) => c.split(";")[0]!)
       .find((c) => c.startsWith("authToken="));
-    if (token) {
-      const maxAge = setCookies.find((c) => /max-age/i.test(c))?.match(/max-age=(\d+)/i)?.[1];
-      // Refresh a day early; the device rotates this token on any other login.
-      const ttlMs = (maxAge ? Number(maxAge) : 7 * 24 * 3600) * 1000;
-      this.cookieExpiresAt = Date.now() + Math.min(ttlMs - 86_400_000, ttlMs);
-    }
     // No authToken cookie => noPassword mode; endpoints work without it.
+    // Cookie expiry is not tracked: the device rotates the token on any other
+    // login, so a 401 (handled by authedFetch's single retry) is the real
+    // expiry signal — not a timer.
     this.lastRotationAt = Date.now();
     this.cookie = token ?? "";
   }
@@ -132,11 +125,6 @@ export class AuthState {
       return doFetch();
     }
     return resp;
-  }
-
-  clear(): void {
-    this.cookie = null;
-    this.cookieExpiresAt = 0;
   }
 }
 

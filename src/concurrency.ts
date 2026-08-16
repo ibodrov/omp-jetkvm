@@ -103,11 +103,36 @@ export function createDeviceLocks(queueTimeoutMs: number): DeviceLocks {
 export interface ClaimInfo {
   pid: number;
   since: number;
+  /** Process start time (Linux /proc stat field 22) — defeats pid reuse. */
+  startTicks?: number | null;
 }
 
 export interface CrossProcessClaim {
   release(): void;
   readonly info: ClaimInfo;
+}
+
+/** /proc/<pid>/stat field 22 (starttime in clock ticks), or null off-Linux. */
+function pidStartTicks(pid: number): number | null {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    // comm can contain spaces/parens — fields restart after the last ')'.
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    const t = Number(fields[19]);
+    return Number.isFinite(t) && t > 0 ? t : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Holder liveness: pid alive AND (when recorded) the same process instance.
+ * Without startTicks, a recycled pid masquerades as the holder forever.
+ */
+export function holderIsLive(info: ClaimInfo): boolean {
+  if (!pidAlive(info.pid)) return false;
+  if (info.startTicks === undefined || info.startTicks === null) return true;
+  return pidStartTicks(info.pid) === info.startTicks;
 }
 
 function claimDir(): string {
@@ -147,7 +172,7 @@ function pidAlive(pid: number): boolean {
  * Throws DeviceBusy when someone else holds a live claim.
  */
 export function acquireCrossProcessClaim(hostname: string, opts: { enabled: boolean; force?: boolean }): CrossProcessClaim {
-  const info: ClaimInfo = { pid: process.pid, since: Date.now() };
+  const info: ClaimInfo = { pid: process.pid, since: Date.now(), startTicks: pidStartTicks(process.pid) };
   const server = net.createServer();
 
   if (process.platform === "linux") {
@@ -156,7 +181,7 @@ export function acquireCrossProcessClaim(hostname: string, opts: { enabled: bool
       server.listen(abstractName);
     } catch (err) {
       const existing = readInfo(hostname);
-      const holder = existing && pidAlive(existing.pid) ? existing : null;
+      const holder = existing && holderIsLive(existing) ? existing : null;
       if (holder && !opts.force) {
         throw new JetKvmError("DeviceBusy", `device ${hostname} input is claimed by omp pid ${holder.pid} since ${new Date(holder.since).toISOString()} — retry with force: true to steal, or set jetkvm.concurrency.crossProcess: none`, {
           holderPid: holder.pid,
@@ -223,7 +248,7 @@ export function acquireCrossProcessClaim(hostname: string, opts: { enabled: bool
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
       const existing = readInfo(hostname);
-      const holder = existing && pidAlive(existing.pid) ? existing : null;
+      const holder = existing && holderIsLive(existing) ? existing : null;
       if (holder && !opts.force) {
         throw new JetKvmError("DeviceBusy", `device ${hostname} input is claimed by omp pid ${holder.pid} since ${new Date(holder.since).toISOString()} — retry with force: true to steal`, {
           holderPid: holder.pid,
@@ -243,6 +268,5 @@ export function acquireCrossProcessClaim(hostname: string, opts: { enabled: bool
 /** Read-only peek at the current claim, if any (for the /jetkvm status card). */
 export function peekCrossProcessClaim(hostname: string): ClaimInfo | null {
   const info = readInfo(hostname);
-  if (info && pidAlive(info.pid)) return info;
-  return null;
+  return info && holderIsLive(info) ? info : null;
 }

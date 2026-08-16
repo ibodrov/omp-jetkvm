@@ -2,8 +2,9 @@
  * Small shared utilities: cookie jar helpers, base64 SDP codec, sleep, clamp.
  * No device knowledge lives here.
  */
-import { join } from "node:path";
+import { createSocket } from "node:dgram";
 import os from "node:os";
+import { join } from "node:path";
 
 export class JetKvmError extends Error {
   constructor(
@@ -79,6 +80,44 @@ export function humanBytes(n: number): string {
     u++;
   }
   return `${v >= 100 || u === 0 ? Math.round(v) : v.toFixed(1)} ${units[u]}`;
+}
+
+/**
+ * Source IPv4 address the kernel picks for traffic to `hostname` — i.e. the
+ * address on the interface that actually faces that host, which is the one
+ * address it can connect back to. UDP-connect trick: no packets leave; the
+ * kernel just resolves the route (fails with no route → null). Handles
+ * multi-homed hosts, VPN-routed devices, and loopback test setups correctly,
+ * unlike a first-interface guess.
+ */
+export async function routeSourceAddress(hostname: string): Promise<string | null> {
+  const sock = createSocket("udp4");
+  const { promise, resolve } = Promise.withResolvers<string | null>();
+  let settled = false;
+  const done = (ip: string | null): void => {
+    if (settled) return;
+    settled = true;
+    try {
+      sock.close();
+    } catch {
+      // already closed
+    }
+    resolve(ip);
+  };
+  sock.once("error", () => done(null));
+  // Port 9 (discard) is never contacted — connect() only makes the kernel
+  // pick a route and source address. DNS/route failures surface as "error".
+  sock.connect(9, hostname, () => {
+    const addr = sock.address() as { address?: string } | null;
+    // "0.0.0.0" = unbound (Bun runs the callback without raising DNS
+    // failures as errors) — never a valid advertise address.
+    const ip =
+      typeof addr?.address === "string" && addr.address !== "" && addr.address !== "0.0.0.0" && !addr.address.startsWith("169.254.")
+        ? addr.address
+        : null;
+    done(ip);
+  });
+  return promise;
 }
 
 /** First non-internal IPv4 address of this machine (for serve_and_mount URLs). */

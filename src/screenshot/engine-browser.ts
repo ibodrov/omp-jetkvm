@@ -3,6 +3,10 @@
  * stream via libwebrtc; the extension does ALL device HTTP itself — the page
  * only exchanges SDP strings and returns canvas pixels (DESIGN §3.2).
  */
+import { spawn, type ChildProcess } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import puppeteer from "puppeteer-core";
 import type { Browser, Page } from "puppeteer-core";
 import { JetKvmError } from "../util.ts";
@@ -42,6 +46,8 @@ export class BrowserEngine implements ScreenshotEngine {
   readonly name = "browser";
   private browser: Browser | null = null;
   private page: Page | null = null;
+  private chromiumProc: ChildProcess | null = null;
+  private chromiumDir: string | null = null;
   private bridgeServer: ReturnType<typeof Bun.serve> | null = null;
   private idleTimer: Timer | null = null;
   private connecting: Promise<void> | null = null;
@@ -82,23 +88,69 @@ export class BrowserEngine implements ScreenshotEngine {
     this.idleTimer.unref?.();
   }
 
+  /**
+   * Launch Chromium directly and attach over the DevTools WebSocket.
+   * NOT puppeteer.launch: its launcher waits on an internal spawn/pipe
+   * handshake that wedges under Bun (node: fine; bun: hangs forever), while
+   * Bun's plain spawn + stderr streaming + ws client are all solid. The
+   * browser announces `DevTools listening on ws://...` on stderr with
+   * --remote-debugging-port=0; we parse and connect.
+   */
   private async ensurePage(): Promise<Page> {
     if (this.page && this.browser) return this.page;
-    this.browser = await puppeteer.launch({
-      executablePath: this.chromiumPath,
-      headless: true,
-      args: [
-        "--no-sandbox",
-        "--no-first-run",
-        "--mute-audio",
-        "--autoplay-policy=no-user-gesture-required",
-        "--disable-features=WebRtcHideLocalIpsWithMdns",
-      ],
+    const userDir = mkdtempSync(join(tmpdir(), "omp-jetkvm-chromium-"));
+    const args = [
+      "--headless=new",
+      "--no-sandbox",
+      "--no-first-run",
+      "--mute-audio",
+      "--autoplay-policy=no-user-gesture-required",
+      "--disable-features=WebRtcHideLocalIpsWithMdns",
+      `--user-data-dir=${userDir}`,
+      "--remote-debugging-port=0",
+      "about:blank",
+    ];
+    const child = spawn(this.chromiumPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+    this.chromiumProc = child;
+    this.chromiumDir = userDir;
+    const { promise, resolve } = Promise.withResolvers<string | Error>();
+    let stderrTail = "";
+    const timer = setTimeout(
+      () => settle(new JetKvmError("ChromiumLaunchTimeout", `chromium did not expose a DevTools endpoint in 15s: ${stderrTail.slice(-200)}`)),
+      15_000,
+    );
+    let settled = false;
+    const settle = (v: string | Error): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(v);
+    };
+    child.stderr!.on("data", (d: Buffer) => {
+      stderrTail += String(d);
+      const m = /DevTools listening on (ws:\/\/\S+)/.exec(stderrTail);
+      if (m) settle(m[1]!);
     });
-    this.page = await this.browser.newPage();
-    await this.page.setDefaultTimeout(30_000);
-    await this.page.goto(this.bridgeUrl(), { waitUntil: "domcontentloaded" });
-    return this.page;
+    child.once("exit", (code) => {
+      settle(new JetKvmError("ChromiumLaunchFailed", `chromium exited early (code ${String(code)}): ${stderrTail.slice(-300)}`));
+    });
+    try {
+      const endpoint = await promise;
+      if (endpoint instanceof Error) throw endpoint;
+      this.browser = await puppeteer.connect({ browserWSEndpoint: endpoint, defaultViewport: null });
+      this.page = await this.browser.newPage();
+      await this.page.setDefaultTimeout(30_000);
+      await this.page.goto(this.bridgeUrl(), { waitUntil: "domcontentloaded" });
+      return this.page;
+    } catch (err) {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // already gone
+      }
+      rmSync(userDir, { recursive: true, force: true });
+      throw err;
+    }
   }
 
   /**
@@ -207,9 +259,30 @@ export class BrowserEngine implements ScreenshotEngine {
     this.browser = null;
     if (browser) {
       try {
+        // We spawned this browser ourselves: close() both disconnects the
+        // ws and shuts the browser down.
         await browser.close();
       } catch {
         // already closed
+      }
+    }
+    const child = this.chromiumProc;
+    this.chromiumProc = null;
+    if (child && child.exitCode === null) {
+      child.kill("SIGTERM");
+      // Fire-and-forget escalate: browser.close() normally ends it; SIGKILL
+      // is the belt for wedged renderers.
+      setTimeout(() => {
+        if (child.exitCode === null) child.kill("SIGKILL");
+      }, 2_000).unref?.();
+    }
+    const dir = this.chromiumDir;
+    this.chromiumDir = null;
+    if (dir) {
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch {
+        // best effort; tmpfs cleans up eventually
       }
     }
   }

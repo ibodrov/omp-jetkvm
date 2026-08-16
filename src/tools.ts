@@ -108,7 +108,12 @@ function err(errLike: unknown): { content: { type: string; text?: string }[]; de
   if (errLike instanceof JetKvmError) {
     return { content: [text(`${errLike.code}: ${errLike.message}`)], details: { code: errLike.code, ...(errLike.details ?? {}) }, isError: true };
   }
-  return { content: [text(`UnexpectedError: ${String(errLike)}`)], details: { code: "UnexpectedError" }, isError: true };
+  // Stack goes to details (not model content) — native crashes stay debuggable.
+  return {
+    content: [text(`UnexpectedError: ${String(errLike)}`)],
+    details: { code: "UnexpectedError", stack: errLike instanceof Error ? String(errLike.stack) : undefined },
+    isError: true,
+  };
 }
 
 export async function disposeEngines(): Promise<void> {
@@ -127,7 +132,7 @@ export function buildScreenshotTool(cfg: JetKvmConfig, z: ZodLike): ToolDefiniti
     name: "jetkvm_screenshot",
     label: "JetKVM screenshot",
     description:
-      "Capture the remote host screen via the JetKVM. Returns an image for the model plus a full-resolution file on disk (details.path). Use action 'state' for a cheap liveness/coordinate check without capturing. Coordinates for jetkvm_mouse are in this image's pixel space (see details.coordinateSpace).",
+      "Capture the remote host screen via the JetKVM. Returns an image for the model plus a full-resolution file on disk (details.path). Use action 'state' for a cheap liveness/coordinate check without capturing. Coordinates for jetkvm_mouse are in this image's pixel space (see details.coordinateSpace). `quality` applies to the inline model copy; the full-res file always encodes at quality >= 85 to stay archival.",
     approval: "read",
     loadMode: "discoverable",
     parameters: z.object({
@@ -322,9 +327,11 @@ export function buildKeyboardTool(cfg: JetKvmConfig, z: ZodLike): ToolDefinition
 
         if (action === "down" || action === "hold_keys") {
           // Manual hold mode: no auto-cleanup (caller must release_all / up).
-          session.ensureClaim(params["force"] as boolean | undefined);
           const release = await session.locks.input.acquire(holder);
           try {
+            // Claim inside the try: an InputBusy timeout must not leave a
+            // cross-process claim behind for a hold that never happened.
+            session.ensureClaim(params["force"] as boolean | undefined);
             const chord = parseChord(String(params["keys"] ?? ""));
             if (chord.usages.length === 0) {
               // modifier-only hold: just the mask
@@ -343,6 +350,11 @@ export function buildKeyboardTool(cfg: JetKvmConfig, z: ZodLike): ToolDefinition
           }
         }
 
+        // Deliberately NOT under the input mutex: a held down/hold_keys parks
+        // the mutex release, so acquiring here would deadlock until queue
+        // timeout. This is the documented escape hatch — it can stomp a
+        // concurrent transaction's held state, which is what "release ALL"
+        // means.
         if (action === "up" || action === "release_all") {
           await session.call("keyboardReport", { modifier: 0, keys: hidKeysPayload([]) });
           await session.call("absMouseReport", { x: 0, y: 0, buttons: 0 });
@@ -400,7 +412,7 @@ export function buildStorageTool(cfg: JetKvmConfig, z: ZodLike): ToolDefinitionL
     name: "jetkvm_storage",
     label: "JetKVM storage",
     description:
-      "Virtual media on the JetKVM. state/space/list_files are read-only. mount_url mounts a device-reachable HTTP URL; serve_and_mount serves a local file via this machine's LAN address (needs the server alive while mounted); upload_and_mount copies into device flash then mounts (durable for unattended installs); upload stores without mounting; mount_file mounts an uploaded file; unmount clears the single media slot; check_url pre-flights a mount URL; delete_file removes a device file.",
+      "Virtual media on the JetKVM. state/space/list_files are read-only. mount_url mounts a device-reachable HTTP URL; serve_and_mount serves a local file via the interface facing the device (needs the server alive while mounted); upload_and_mount copies into device flash then mounts (durable for unattended installs); upload stores without mounting (reserves a free-space margin: max(5% of file, 64 MiB) — tune with minFreeBytes); mount_file mounts an uploaded file; unmount clears the single media slot; check_url pre-flights a mount URL; delete_file removes a device file.",
     approval: "write",
     loadMode: "discoverable",
     parameters: z.object({
@@ -450,10 +462,12 @@ export function buildStorageTool(cfg: JetKvmConfig, z: ZodLike): ToolDefinitionL
             break;
         }
 
-        // Mutations: storage mutex + cross-process claim.
-        session.ensureClaim(params["force"] as boolean | undefined);
+        // Mutations: storage mutex + cross-process claim. Mutex first, claim
+        // inside the try (same reasoning as input): a StorageBusy timeout
+        // must not leave a cross-process claim behind.
         const release = await session.locks.storage.acquire(holder);
         try {
+          session.ensureClaim(params["force"] as boolean | undefined);
           switch (action) {
             case "delete_file": {
               const filename = String(params["filename"] ?? "");
@@ -548,7 +562,7 @@ export function buildDeviceTool(cfg: JetKvmConfig, z: ZodLike): ToolDefinitionLi
             const status = await getDeviceStatus(session);
             const atx = status.atxState as { power?: boolean } | null;
             return {
-              content: [text(`device ${session.auth.hostname}: ${atx?.power === true ? "host POWERED ON" : atx?.power === false ? "host powered off" : "host power unknown"}; video ${JSON.stringify(status.videoState)}; layout ${JSON.stringify(status.keyboardLayout)}; media ${JSON.stringify(status.virtualMedia)}`)],
+              content: [text(`device ${session.auth.hostname}: fw ${JSON.stringify(status.localVersion)}; ${atx?.power === true ? "host POWERED ON" : atx?.power === false ? "host powered off" : "host power unknown"}; video ${JSON.stringify(status.videoState)}; layout ${JSON.stringify(status.keyboardLayout)}; media ${JSON.stringify(status.virtualMedia)}`)],
               details: { ...status, device: session.name },
             };
           }

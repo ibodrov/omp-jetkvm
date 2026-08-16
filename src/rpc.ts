@@ -47,7 +47,7 @@ export class JsonRpcClient {
    * anything with `method` and no `id` is an unsolicited event.
    */
   handleMessage(data: string | Buffer): void {
-    if (this.closed && this.pending.size === 0) return;
+    if (this.closed) return; // close() rejects all pending; late frames are junk
     let msg: Record<string, unknown>;
     try {
       msg = JSON.parse(String(data));

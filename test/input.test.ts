@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { CHAR_USAGE, hidKeysPayload, KEY_USAGE, MODIFIER_BITS, parseChord } from "../src/input.ts";
-import { JetKvmError, pixelToHid, sdpCodec } from "../src/util.ts";
+import { JetKvmError, pixelToHid, routeSourceAddress, sdpCodec } from "../src/util.ts";
 
 describe("USB HID keymap (HID Usage Tables)", () => {
   test("a-z and 0-9 usage IDs", () => {
@@ -42,6 +42,8 @@ describe("USB HID keymap (HID Usage Tables)", () => {
     expect(CHAR_USAGE["|"]).toEqual({ usage: 0x31, shift: true });
     expect(CHAR_USAGE["{"]).toEqual({ usage: 0x2f, shift: true });
     expect(CHAR_USAGE["\n"]!.usage).toBe(0x28);
+    // \r maps to enter so \r\n text doesn't die on the carriage return
+    expect(CHAR_USAGE["\r"]).toEqual({ usage: 0x28, shift: false });
     expect(CHAR_USAGE["\t"]!.usage).toBe(0x2b);
     expect(CHAR_USAGE[" "]!.usage).toBe(0x2c);
     expect(CHAR_USAGE["é"]).toBeUndefined();
@@ -96,8 +98,9 @@ describe("hidKeysPayload", () => {
   test("zero-pads to 6 slots", () => {
     expect(hidKeysPayload([0x04])).toEqual([0x04, 0, 0, 0, 0, 0]);
   });
-  test("caps at 6 keys", () => {
-    expect(hidKeysPayload([1, 2, 3, 4, 5, 6, 7])).toHaveLength(6);
+  test("more than 6 keys throws instead of silently dropping", () => {
+    expect(() => hidKeysPayload([1, 2, 3, 4, 5, 6, 7])).toThrow(JetKvmError);
+    expect(() => hidKeysPayload([1, 2, 3, 4, 5, 6, 7])).toThrow(/at most 6/);
   });
 });
 
@@ -130,5 +133,14 @@ describe("sdpCodec", () => {
   });
   test("rejects garbage", () => {
     expect(() => sdpCodec.decode(Buffer.from("[]").toString("base64"))).toThrow();
+  });
+});
+
+describe("routeSourceAddress", () => {
+  test("loopback route resolves to the loopback address", async () => {
+    expect(await routeSourceAddress("127.0.0.1")).toBe("127.0.0.1");
+  });
+  test("unroutable/unresolvable host yields null, not a guess", async () => {
+    expect(await routeSourceAddress("no-such-host.invalid")).toBe(null);
   });
 });

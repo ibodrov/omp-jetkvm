@@ -21,15 +21,9 @@ export interface DeviceStatus {
 export async function getDeviceStatus(session: DeviceSession): Promise<DeviceStatus> {
   const devResp = await session.auth.authedFetch("/device");
   const setupResp = await fetch(`${session.auth.origin}/device/status`, { headers: { Connection: "close" } }).catch(() => null);
-  let localVersion: unknown = null;
-  let networkState: unknown = null;
-  let videoState: unknown = null;
-  let atxState: unknown = null;
-  let usbState: unknown = null;
-  let keyboardLayout: unknown = null;
-  let virtualMedia: unknown = null;
   // Individual RPC failures degrade to null — status must stay useful under
-  // firmware drift (DESIGN goal 4).
+  // firmware drift (DESIGN goal 4). Fan out: this is a status card, and the
+  // RPC client multiplexes concurrent calls by id.
   const safe = async (method: string): Promise<unknown> => {
     try {
       return await session.call(method, {}, { retryOnReconnect: true });
@@ -37,13 +31,15 @@ export async function getDeviceStatus(session: DeviceSession): Promise<DeviceSta
       return null;
     }
   };
-  localVersion = await safe("getLocalVersion");
-  networkState = await safe("getNetworkState");
-  videoState = await safe("getVideoState");
-  atxState = await safe("getATXState");
-  usbState = await safe("getUSBState");
-  keyboardLayout = await safe("getKeyboardLayout");
-  virtualMedia = await safe("getVirtualMediaState");
+  const [localVersion, networkState, videoState, atxState, usbState, keyboardLayout, virtualMedia] = await Promise.all([
+    safe("getLocalVersion"),
+    safe("getNetworkState"),
+    safe("getVideoState"),
+    safe("getATXState"),
+    safe("getUSBState"),
+    safe("getKeyboardLayout"),
+    safe("getVirtualMediaState"),
+  ]);
   return {
     device: devResp.ok ? ((await devResp.json()) as Record<string, unknown>) : null,
     isSetup: setupResp?.ok ? ((await setupResp.json()) as { isSetup?: boolean }).isSetup ?? null : null,

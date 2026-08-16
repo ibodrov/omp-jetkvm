@@ -1,7 +1,7 @@
 /**
  * Screenshot engine contract + auto selection. DESIGN §3.2.
  */
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { JetKvmError, timestampName } from "../util.ts";
 import { findRecorderBin, RecorderEngine } from "./engine-recorder.ts";
@@ -12,7 +12,9 @@ export function writeScreenshotFile(fullB64: string, mime: string, dir: string):
   mkdirSync(dir, { recursive: true });
   const ext = mime === "image/png" ? "png" : "jpg";
   const path = join(dir, `jetkvm_${timestampName()}.${ext}`);
-  Bun.write(path, Buffer.from(fullB64, "base64"));
+  // Sync on purpose: the tool reports success with this path; a deferred
+  // write could fail after the fact (or reject unhandled) on ENOSPC etc.
+  writeFileSync(path, Buffer.from(fullB64, "base64"));
   return path;
 }
 

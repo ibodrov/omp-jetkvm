@@ -88,6 +88,8 @@ export const CHAR_USAGE: Record<string, { usage: number; shift: boolean }> = (()
   for (const [ch, usage] of Object.entries(plain)) map[ch] = { usage, shift: false };
   for (const [ch, base] of Object.entries(shifted)) map[ch] = { usage: plain[base]!, shift: true };
   map["\n"] = { usage: KEY_USAGE.enter!, shift: false };
+  // \r\n text must not die on the carriage return (model output is full of it).
+  map["\r"] = { usage: KEY_USAGE.enter!, shift: false };
   map["\t"] = { usage: KEY_USAGE.tab!, shift: false };
   return map;
 })();
@@ -141,9 +143,18 @@ export function parseChord(spec: string): Chord {
   }
   return { modifierMask, usages };
 }
-
-/** Zero-pad usage ids to the 6-slot HID boot report. */
+/**
+ * Zero-pad usage ids to the 6-slot HID boot report. More than 6 keys cannot
+ * be carried — throw rather than silently dropping key 7.
+ */
 export function hidKeysPayload(usages: number[]): number[] {
+  if (usages.length > 6) {
+    throw new JetKvmError(
+      "BadChord",
+      `chord carries ${usages.length} keys but the HID boot protocol reports at most 6 — split the chord`,
+      { usages },
+    );
+  }
   const keys = usages.slice(0, 6).map((u) => clamp(u, 0, 255));
   while (keys.length < 6) keys.push(0);
   return keys;
@@ -187,8 +198,12 @@ interface HeldState {
 /** DOM-style button mask (DESIGN §2.4): left 1, right 2, middle 4. */
 export const MOUSE_BUTTONS = { left: 1, right: 2, middle: 4 } as const;
 
-async function foreignInputCheck(session: DeviceSession, held: HeldState, warnings: string[]): Promise<void> {
-  if (held.modifierMask !== 0 || held.buttons !== 0) return; // holding things; baseline meaningless
+/**
+ * Pre-transaction baseline: anything the device already reports as held was
+ * pressed by someone else (human at the local UI, another machine) — surface
+ * it as a warning so agents know the field isn't clean. Heuristic only.
+ */
+async function foreignInputCheck(session: DeviceSession, warnings: string[]): Promise<void> {
   try {
     const down = (await session.call("getKeyDownState", {}, { timeoutMs: 3_000 })) as {
       modifier?: number;
@@ -215,7 +230,9 @@ export async function runInputTransaction<T>(
   fn: (tx: InputTransaction) => Promise<T>,
   opts: { signal?: AbortSignal; force?: boolean } = {},
 ): Promise<{ result: T; warnings: string[] }> {
-  session.ensureClaim(opts.force);
+  // Mutex first, claim second: a queue-timeout (InputBusy) must not leave a
+  // cross-process claim behind for a transaction that never ran. The claim
+  // is session-scoped once acquired — released at teardown.
   const release = await session.locks.input.acquire(holder);
   const held: HeldState = { modifierMask: 0, keyUsages: [], buttons: 0, pointer: { x: 0, y: 0 } };
   const warnings: string[] = [];
@@ -254,7 +271,8 @@ export async function runInputTransaction<T>(
   };
 
   try {
-    await foreignInputCheck(session, held, warnings);
+    session.ensureClaim(opts.force);
+    await foreignInputCheck(session, warnings);
     if (session.auth.tokenRotatedRecently(startedAt - 60_000)) {
       warnings.push("auth token rotated recently — another client (browser UI?) may be active");
     }
