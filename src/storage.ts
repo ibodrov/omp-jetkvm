@@ -33,8 +33,8 @@ function firmwareLacks(err: unknown): boolean {
   return err instanceof JetKvmError && deviceCodeOf(err) === -32601;
 }
 
-export async function listFiles(session: DeviceSession): Promise<{ files: { filename: string; size: number; createdAt: string }[] }> {
-  const r = (await session.call("listStorageFiles", {}, { retryOnReconnect: true })) as { files?: unknown[] } | null;
+export async function listFiles(session: DeviceSession, signal?: AbortSignal): Promise<{ files: { filename: string; size: number; createdAt: string }[] }> {
+  const r = (await session.call("listStorageFiles", {}, { retryOnReconnect: true, signal })) as { files?: unknown[] } | null;
   if (!r || !Array.isArray(r.files)) return { files: [] };
   return {
     files: r.files.map((f) => {
@@ -48,12 +48,12 @@ export async function listFiles(session: DeviceSession): Promise<{ files: { file
   };
 }
 
-export async function getSpace(session: DeviceSession): Promise<{ bytesUsed: number; bytesFree: number }> {
-  return (await session.call("getStorageSpace", {}, { retryOnReconnect: true })) as { bytesUsed: number; bytesFree: number };
+export async function getSpace(session: DeviceSession, signal?: AbortSignal): Promise<{ bytesUsed: number; bytesFree: number }> {
+  return (await session.call("getStorageSpace", {}, { retryOnReconnect: true, signal })) as { bytesUsed: number; bytesFree: number };
 }
 
-export async function getMountState(session: DeviceSession): Promise<VirtualMediaState | null> {
-  return (await session.call("getVirtualMediaState", {}, { retryOnReconnect: true })) as VirtualMediaState | null;
+export async function getMountState(session: DeviceSession, signal?: AbortSignal): Promise<VirtualMediaState | null> {
+  return (await session.call("getVirtualMediaState", {}, { retryOnReconnect: true, signal })) as VirtualMediaState | null;
 }
 /** Mount/unmount drive USB-gadget reinit and can block for tens of seconds
  *  (observed live); storage mutations get their own generous timeout. */
@@ -76,12 +76,17 @@ async function clearSlot(session: DeviceSession, policy: PolicyConfig): Promise<
 export async function mountUrl(
   session: DeviceSession,
   policy: PolicyConfig,
-  opts: { url: string; mode?: MountMode },
+  opts: { url: string; mode?: MountMode; signal?: AbortSignal },
 ): Promise<{ check: Record<string, unknown> }> {
   let check: Record<string, unknown> = {};
   try {
-    check = (await session.call("checkMountUrl", { url: opts.url }, { timeoutMs: 15_000 })) as Record<string, unknown>;
+    check = (await session.call(
+      "checkMountUrl",
+      { url: opts.url },
+      { timeoutMs: 15_000, signal: opts.signal },
+    )) as Record<string, unknown>;
   } catch (err) {
+    if (err instanceof JetKvmError && err.code === "Aborted") throw err;
     // Firmware 0.5.8 quirk: checkMountUrl probes the URL (we see the GET)
     // but its handler errors internally (-32603). Treat as advisory only;
     // mountWithHTTP below is the real gate and works.
@@ -90,6 +95,7 @@ export async function mountUrl(
   if (check["usable"] === false) {
     throw new JetKvmError("MountUrlUnusable", `device cannot mount ${opts.url}: ${String(check["reason"] ?? "no reason given")}`, { check });
   }
+  if (opts.signal?.aborted) throw new JetKvmError("Aborted", "mount URL operation aborted");
   await clearSlot(session, policy);
   try {
     await session.call("mountWithHTTP", { url: opts.url, mode: opts.mode ?? "CDROM" }, { timeoutMs: MOUNT_TIMEOUT_MS });
@@ -114,13 +120,11 @@ export async function mountFile(
 }
 
 export async function unmount(session: DeviceSession): Promise<Record<string, unknown>> {
-  try {
-    await session.call("unmountImage", {}, { timeoutMs: MOUNT_TIMEOUT_MS });
-  } finally {
-    // Server death while media stays mounted wedges the device's storage
-    // handler (observed live); always stop serving when leaving unmount.
-    stopServeServer(session);
-  }
+  // Stop the server only after unmountImage is acknowledged. A timeout or
+  // connection error is ambiguous: the media may still be mounted, and
+  // killing its server in that state wedges the firmware storage handler.
+  await session.call("unmountImage", {}, { timeoutMs: MOUNT_TIMEOUT_MS });
+  stopServeServer(session);
   return { unmounted: true, state: await getMountState(session) };
 }
 
@@ -160,28 +164,54 @@ export async function uploadFile(session: DeviceSession, opts: UploadOptions): P
     throw new JetKvmError("FileNotFound", `no such file: ${path}`);
   }
   const stat = statSync(path);
+  if (!stat.isFile()) {
+    throw new JetKvmError("BadParams", `upload path is not a regular file: ${path}`);
+  }
   const filename = opts.filename ?? basename(path);
-  const space = await getSpace(session);
+  if (!filename || basename(filename) !== filename || filename === "." || filename === "..") {
+    throw new JetKvmError("BadParams", "upload filename must be a plain non-empty filename");
+  }
   const margin = opts.minFreeBytes ?? Math.max(stat.size * 0.05, 64 * 1024 * 1024);
-  if (space.bytesFree < stat.size + margin) {
+  if (!Number.isFinite(margin) || margin < 0) {
+    throw new JetKvmError("BadParams", "minFreeBytes must be a finite non-negative number");
+  }
+  const rawStart = await session.call(
+    "startStorageFileUpload",
+    { filename, size: stat.size },
+    { signal: opts.signal },
+  );
+  if (typeof rawStart !== "object" || rawStart === null) {
     throw new JetKvmError(
-      "StorageFull",
-      `device has ${humanBytes(space.bytesFree)} free but the file is ${humanBytes(stat.size)} (margin ${humanBytes(margin)}) — delete files or use serve_and_mount (no device storage needed)`,
+      "UnexpectedResponse",
+      `startStorageFileUpload returned a malformed result: ${JSON.stringify(rawStart).slice(0, 200)}`,
     );
   }
-  const start = (await session.call("startStorageFileUpload", { filename, size: stat.size })) as {
-    alreadyUploadedBytes: number;
-    dataChannel: string;
-  };
-  if (typeof start.dataChannel !== "string" || typeof start.alreadyUploadedBytes !== "number") {
+  const start = rawStart as Record<string, unknown>;
+  if (
+    typeof start["dataChannel"] !== "string" ||
+    start["dataChannel"] === "" ||
+    typeof start["alreadyUploadedBytes"] !== "number" ||
+    !Number.isSafeInteger(start["alreadyUploadedBytes"]) ||
+    start["alreadyUploadedBytes"] < 0 ||
+    start["alreadyUploadedBytes"] > stat.size
+  ) {
     throw new JetKvmError(
       "UnexpectedResponse",
       `startStorageFileUpload returned a malformed result: ${JSON.stringify(start).slice(0, 200)}`,
     );
   }
-  const offset = Math.max(0, Math.min(start.alreadyUploadedBytes, stat.size));
+  const dataChannel = start["dataChannel"];
+  const offset = start["alreadyUploadedBytes"];
   if (offset >= stat.size) {
     return { filename, totalBytes: stat.size, resumedFrom: offset, state: await getMountState(session) };
+  }
+  const space = await getSpace(session, opts.signal);
+  const remaining = stat.size - offset;
+  if (space.bytesFree < remaining + margin) {
+    throw new JetKvmError(
+      "StorageFull",
+      `device has ${humanBytes(space.bytesFree)} free but the remaining upload is ${humanBytes(remaining)} (margin ${humanBytes(margin)}) — delete files or use serve_and_mount (no device storage needed)`,
+    );
   }
 
   const file: BunFile = Bun.file(path);
@@ -202,7 +232,7 @@ export async function uploadFile(session: DeviceSession, opts: UploadOptions): P
   );
 
   const resp = await session.auth.authedFetch(
-    `/storage/upload?uploadId=${encodeURIComponent(start.dataChannel)}`,
+    `/storage/upload?uploadId=${encodeURIComponent(dataChannel)}`,
     {
       method: "POST",
       // No Content-Type: raw remaining bytes (DESIGN §2.1).
@@ -277,11 +307,17 @@ export function stopServeServer(session: DeviceSession): void {
 export async function retireServeServer(session: DeviceSession, policy: PolicyConfig): Promise<void> {
   const entry = serveRegistry().get(session.auth.hostname);
   if (!entry) return;
-  let state: VirtualMediaState | null = null;
+  let state: VirtualMediaState | null;
   try {
     state = await getMountState(session);
-  } catch {
-    state = null; // device unreachable: stopping the server is all we can do
+  } catch (err) {
+    // Unknown is not equivalent to unmounted. Keep serving rather than risk
+    // wedging a device that still range-reads this URL.
+    throw new JetKvmError(
+      "VirtualMediaStateUnknown",
+      `cannot verify whether ${entry.url} is still mounted; keeping its server alive`,
+      { cause: err instanceof Error ? err.message : String(err) },
+    );
   }
   if (state?.url && state.url === entry.url) {
     await clearSlot(session, policy);
@@ -309,7 +345,6 @@ export async function shutdownServe(session: DeviceSession): Promise<void> {
   stopServeServer(session);
 }
 
-
 export async function serveAndMount(
   session: DeviceSession,
   policy: PolicyConfig,
@@ -319,7 +354,11 @@ export async function serveAndMount(
   if (!existsSync(path)) {
     throw new JetKvmError("FileNotFound", `no such file: ${path}`);
   }
-  const size = statSync(path).size;
+  const stat = statSync(path);
+  if (!stat.isFile()) {
+    throw new JetKvmError("BadParams", `serve_and_mount path is not a regular file: ${path}`);
+  }
+  const size = stat.size;
   // Bind + advertise on the interface that actually faces the device: the
   // kernel's chosen source address for the route to it (multi-homed, VPN and
   // loopback-test setups all resolve correctly; no packets sent). Anything
@@ -345,6 +384,9 @@ export async function serveAndMount(
     idleTimeout: 255,
     async fetch(req) {
       const url = new URL(req.url);
+      if (req.method !== "GET" && req.method !== "HEAD") {
+        return new Response("method not allowed", { status: 405, headers: { Allow: "GET, HEAD" } });
+      }
       if (url.pathname !== "/iso") {
         return new Response("not found", { status: 404 });
       }
@@ -390,7 +432,15 @@ export async function serveAndMount(
       note: "the HTTP server lives as long as the media stays mounted; it stops on unmount or session end",
     };
   } catch (err) {
-    stopServeServer(session);
+    // mountWithHTTP can succeed device-side while its response is lost. Stop
+    // the fresh server only when a follow-up state read proves this URL is not
+    // mounted; unknown or matching state must keep the server alive.
+    try {
+      const state = await getMountState(session);
+      if (state?.url !== url) stopServeServer(session);
+    } catch {
+      // state unknown: keep serving
+    }
     throw err;
   }
 }

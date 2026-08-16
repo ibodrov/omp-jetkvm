@@ -4,9 +4,10 @@
  * refusal must leave the old server alive.
  */
 import { beforeEach, describe, expect, test } from "bun:test";
-import { retireServeServer } from "../src/storage.ts";
+import { retireServeServer, serveAndMount, stopServeServer, unmount } from "../src/storage.ts";
 import type { DeviceSession } from "../src/connection.ts";
 import type { PolicyConfig } from "../src/config.ts";
+import { rmSync, writeFileSync } from "node:fs";
 
 const POLICY: PolicyConfig = { allowPowerActions: true, allowUsbDisconnect: false, forceUnmountOnMount: true };
 const HOSTNAME = "retire-test.local";
@@ -87,12 +88,14 @@ describe("retireServeServer", () => {
     expect(serveEntryExists()).toBe(false);
   });
 
-  test("device unreachable: stops the server, never throws", async () => {
+  test("device unreachable: keeps the server alive and reports uncertainty", async () => {
     const entry = makeServeEntry();
     injectServeEntry(entry.url, entry.stop);
     const { session } = fakeSession(new Error("rpc dead"));
-    await expect(retireServeServer(session, POLICY)).resolves.toBeUndefined();
-    expect(serveEntryExists()).toBe(false);
+    await expect(retireServeServer(session, POLICY)).rejects.toThrow(/keeping its server alive/);
+    expect(serveEntryExists()).toBe(true);
+    entry.stop();
+    serveRegistryMap().delete(HOSTNAME);
   });
 
   test("policy refusal propagates and leaves the server alive", async () => {
@@ -105,11 +108,61 @@ describe("retireServeServer", () => {
     // clearSlot re-reads the mount state before refusing.
     expect(calls.map((c) => c.method)).toEqual(["getVirtualMediaState", "getVirtualMediaState"]);
     expect(serveEntryExists()).toBe(true); // no wedge: server still serving
+    entry.stop();
+    serveRegistryMap().delete(HOSTNAME);
   });
 
   test("no previous entry: no-op", async () => {
     const { session, calls } = fakeSession(null);
     await retireServeServer(session, POLICY);
     expect(calls).toEqual([]);
+  });
+});
+
+describe("unmount server safety", () => {
+  test("an ambiguous unmount failure leaves the server running", async () => {
+    const entry = makeServeEntry();
+    injectServeEntry(entry.url, entry.stop);
+    const session = {
+      auth: { hostname: HOSTNAME },
+      async call(method: string) {
+        if (method === "unmountImage") throw new Error("response lost");
+        return null;
+      },
+    } as unknown as DeviceSession;
+    await expect(unmount(session)).rejects.toThrow(/response lost/);
+    expect(serveEntryExists()).toBe(true);
+    entry.stop();
+    serveRegistryMap().delete(HOSTNAME);
+  });
+
+  test("a lost mount response keeps a server that the device reports mounted", async () => {
+    const path = "/tmp/omp-jetkvm-serve-response-lost.iso";
+    writeFileSync(path, Buffer.alloc(4_096));
+    let mountedUrl: string | null = null;
+    const session = {
+      auth: { hostname: "127.0.0.1" },
+      state: "connected",
+      async call(method: string, params: Record<string, unknown> = {}) {
+        if (method === "getVirtualMediaState") {
+          return mountedUrl ? { source: "HTTP", mode: "CDROM", url: mountedUrl } : null;
+        }
+        if (method === "checkMountUrl") return {};
+        if (method === "mountWithHTTP") {
+          mountedUrl = String(params["url"]);
+          throw new Error("response lost");
+        }
+        return null;
+      },
+    } as unknown as DeviceSession;
+    try {
+      await expect(
+        serveAndMount(session, POLICY, { path }),
+      ).rejects.toThrow(/response lost/);
+      expect(serveRegistryMap().has("127.0.0.1")).toBe(true);
+    } finally {
+      stopServeServer(session);
+      rmSync(path, { force: true });
+    }
   });
 });

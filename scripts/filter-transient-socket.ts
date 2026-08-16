@@ -21,12 +21,7 @@ Object.defineProperty(process, "on", {
       const wrapped = (err: Error, ...inner: unknown[]): void => {
         const msg = String(err?.message ?? "");
         const stack = err?.stack ?? "";
-        if (/ECONNREFUSED/.test(msg) && !stack.includes("\n")) {
-          try {
-            require("node:fs").appendFileSync("/tmp/omp-socket-filter.log", `[swallowed] ${msg}\n`);
-          } catch {
-            // logging best-effort
-          }
+        if (msg === "ECONNREFUSED: connection refused, recv" && !stack.includes("\n")) {
           return;
         }
         return fn(err, ...inner);

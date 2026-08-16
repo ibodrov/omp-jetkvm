@@ -20,8 +20,8 @@ agent ──omp tools──▶ omp-jetkvm (in-process, Bun)
 | `jetkvm_screenshot` | read | Capture the host screen (model-sized inline image + full-res file). `state` for cheap liveness. |
 | `jetkvm_mouse` | write | move / click / double_click / right_click / drag / scroll / down / up — screenshot pixel coordinates. `down` holds the button until `up` / `release_all` (like keyboard holds). |
 | `jetkvm_keyboard` | write | type (US layout; validated before typing — unmappable chars fail without a partial prefix, `\r\n` types one enter) / press chords (`ctrl+alt+t`, `win+r`, `right-ctrl`) / hold_keys / release_all. |
-| `jetkvm_storage` | write | list/delete device files, space, mount ISO by URL, serve a local file, upload+mount, unmount. |
-| `jetkvm_device` | read* | status, video state, ATX power ops, Wake-on-LAN, USB emulation, keyboard layout. *power ops are policy-gated. |
+| `jetkvm_storage` | per action | reads are `read`, mount/upload mutations are `write`, and deletion is `exec`. |
+| `jetkvm_device` | per action | status/state reads are `read`, configuration writes are `write`, and power/wake/USB changes are `exec` plus policy gates. |
 
 Slash command: `/jetkvm` (status card), `/jetkvm reconnect`.
 
@@ -56,7 +56,7 @@ Full schema and design rationale: `DESIGN.md`.
 ## Concurrency & safety
 - One input transaction at a time per device (in-process mutex, holder reported on contention).
 - Manual holds (keyboard `down`/`hold_keys`, mouse `down`) park the input mutex until `up`/`release_all`; a dropped connection drains them so the lock never sticks.
-- Cross-process claim (abstract-socket on Linux) so two omp sessions on one machine don't both drive HID; `force: true` overrides a stale claim, `concurrency.crossProcess: none` disables.
+- Cross-process claim (abstract socket on Linux) so two omp sessions on one machine don't both drive HID; stale sidecars are reclaimed automatically, a live Linux kernel claim cannot be force-stolen, and `concurrency.crossProcess: none` disables claiming.
 - Input never auto-retries across reconnects (replay danger). Any abort/error mid-transaction releases all held keys/buttons. Reconnect backoff happens before the input mutex is taken, so a down device never starves other callers into `InputBusy`.
 - Connections (including the browser screenshot engine) share one auth session per device — the device rotates its single token on every login, so parallel logins would invalidate each other.
 - The device has no input interlock: a human at the local UI (or another machine) can inject concurrently; the tools surface "foreign input suspected" warnings when detectable.

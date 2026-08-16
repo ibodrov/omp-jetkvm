@@ -18,16 +18,26 @@ export interface DeviceStatus {
   virtualMedia: unknown;
 }
 
-export async function getDeviceStatus(session: DeviceSession): Promise<DeviceStatus> {
-  const devResp = await session.auth.authedFetch("/device");
-  const setupResp = await fetch(`${session.auth.origin}/device/status`, { headers: { Connection: "close" } }).catch(() => null);
+export async function getDeviceStatus(session: DeviceSession, signal?: AbortSignal): Promise<DeviceStatus> {
+  const devResp = await session.auth.authedFetch("/device", { signal });
+  let setupResp: Response | null;
+  try {
+    setupResp = await fetch(`${session.auth.origin}/device/status`, {
+      headers: { Connection: "close" },
+      signal,
+    });
+  } catch {
+    if (signal?.aborted) throw new JetKvmError("Aborted", "device status request aborted");
+    setupResp = null;
+  }
   // Individual RPC failures degrade to null — status must stay useful under
   // firmware drift (DESIGN goal 4). Fan out: this is a status card, and the
   // RPC client multiplexes concurrent calls by id.
   const safe = async (method: string): Promise<unknown> => {
     try {
-      return await session.call(method, {}, { retryOnReconnect: true });
-    } catch {
+      return await session.call(method, {}, { retryOnReconnect: true, signal });
+    } catch (err) {
+      if (err instanceof JetKvmError && err.code === "Aborted") throw err;
       return null;
     }
   };

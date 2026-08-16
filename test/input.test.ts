@@ -6,6 +6,7 @@ import {
   KEY_USAGE,
   MODIFIER_BITS,
   parseChord,
+  pressChord,
   prepareText,
   typeText,
   type InputTransaction,
@@ -102,6 +103,22 @@ describe("parseChord", () => {
   test("empty chord throws", () => {
     expect(() => parseChord("")).toThrow(JetKvmError);
   });
+  test("press holds multiple non-modifier usages together", async () => {
+    const reports: { modifier: number; usages: number[] }[] = [];
+    const tx: InputTransaction = {
+      async keyboardReport(modifier, usages) {
+        reports.push({ modifier, usages });
+      },
+      async mouseReport() {},
+      async wheelReport() {},
+      async abortableSleep() {},
+    };
+    await pressChord(tx, parseChord("ctrl+a+b"), 40);
+    expect(reports.filter((report) => report.usages.length > 0)).toEqual([
+      { modifier: 1, usages: [KEY_USAGE["a"]!, KEY_USAGE["b"]!] },
+    ]);
+  });
+
 });
 
 describe("hidKeysPayload", () => {
@@ -133,6 +150,11 @@ describe("pixelToHid (DESIGN §3.3)", () => {
     expect(pixelToHid(319, 320)).toBe(32767);
     expect(pixelToHid(639, 640)).toBe(32767);
   });
+  test("single-pixel extents always map to zero", () => {
+    expect(pixelToHid(0, 1)).toBe(0);
+    expect(pixelToHid(99, 1)).toBe(0);
+  });
+
 });
 
 describe("sdpCodec", () => {

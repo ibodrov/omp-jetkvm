@@ -5,10 +5,10 @@
  * must happen before the input mutex is taken.
  */
 import { describe, expect, test } from "bun:test";
-import { buildKeyboardTool, buildMouseTool, type ToolDefinitionLike, type ZodLike } from "../src/tools.ts";
+import { buildKeyboardTool, buildMouseTool, buildScreenshotTool, type ToolDefinitionLike, type ZodLike } from "../src/tools.ts";
 import { ConnectionManager, DeviceSession, sharedAuthState } from "../src/connection.ts";
 import { createDeviceLocks, type DeviceLocks } from "../src/concurrency.ts";
-import { registerHeldRelease } from "../src/input.ts";
+import { registerHeldRelease, runInputTransaction } from "../src/input.ts";
 import type { JetKvmConfig } from "../src/config.ts";
 
 const HOST = "10.243.0.1"; // never dialed: a fake session is injected below
@@ -48,12 +48,11 @@ function fakeSession() {
     },
   };
   // Inject into the process-global registry so ConnectionManager.session()
-  // hands out the fake (same key it uses: dev.host). The map may not exist
-  // yet — create it, mirroring connection.ts's registry().
+  // hands out the fake (same normalized-origin key it uses).
   const registryKey = Symbol.for("omp-jetkvm.registry");
   const g = globalThis as Record<symbol, { sessions: Map<string, DeviceSession> } | undefined>;
   if (!g[registryKey]) g[registryKey] = { sessions: new Map() };
-  g[registryKey]!.sessions.set(HOST, session as unknown as DeviceSession);
+  g[registryKey]!.sessions.set(`http://${HOST}`, session as unknown as DeviceSession);
   return { session: session as unknown as DeviceSession, calls, order, locks };
 }
 function fakeZ(): ZodLike {
@@ -114,6 +113,15 @@ describe("mouse down/up manual holds", () => {
   });
 });
 
+describe("screenshot state", () => {
+  test("does not require a configured screenshot engine", async () => {
+    fakeSession();
+    const result = await run(buildScreenshotTool(cfg, fakeZ()), { action: "state" });
+    expect(result.isError).toBeFalsy();
+    expect(result.details?.videoState).toEqual({ width: 1920, height: 1080 });
+  });
+});
+
 describe("keyboard release_all pointer handling", () => {
   test("releases mouse buttons at the last reported position", async () => {
     const { session, calls } = fakeSession();
@@ -133,7 +141,46 @@ describe("connect-before-mutex ordering", () => {
     await run(mouseTool(), { action: "move", x: 10, y: 10 });
     expect(order.indexOf("ensureConnected")).toBeLessThan(order.indexOf("acquire"));
   });
+  test("manual keyboard holds connect before acquiring the input mutex", async () => {
+    const { order } = fakeSession();
+    await run(keyboardTool(), { action: "down", keys: "right-ctrl" });
+    await run(keyboardTool(), { action: "release_all" });
+    expect(order.indexOf("ensureConnected")).toBeLessThan(order.indexOf("acquire"));
+  });
+
 });
+describe("ambiguous input failures", () => {
+  test("a lost key-down response still triggers a zero cleanup report", async () => {
+    const reports: Record<string, unknown>[] = [];
+    const locks = createDeviceLocks(1_000);
+    const session = {
+      auth: { tokenRotatedRecently: () => false },
+      locks,
+      lastMouse: null,
+      async ensureConnected() {},
+      ensureClaim() {},
+      async call(method: string, params: Record<string, unknown> = {}) {
+        if (method === "getKeyDownState") {
+          return { modifier: 0, keys: [0, 0, 0, 0, 0, 0] };
+        }
+        if (method === "keyboardReport") {
+          reports.push(params);
+          if (params["modifier"] === 1) throw new Error("response lost");
+        }
+        return null;
+      },
+    } as unknown as DeviceSession;
+
+    await expect(
+      runInputTransaction(session, "failure-test", async (tx) => {
+        await tx.keyboardReport(1, []);
+      }),
+    ).rejects.toThrow(/response lost/);
+    expect(reports.map((report) => report["modifier"])).toEqual([1, 0]);
+    expect(locks.input.holderInfo.held).toBe(false);
+  });
+});
+
 describe("teardown drains parked holds", () => {
   test("dispose releases a parked manual hold's mutex", async () => {
     // Real DeviceSession: dispose() runs the production teardown path.
@@ -157,9 +204,9 @@ describe("sharedAuthState", () => {
     expect(a).not.toBe(c);
     const multi: JetKvmConfig = {
       ...(cfg as JetKvmConfig),
-      devices: { one: { host: HOST }, two: { host: HOST } },
+      devices: { one: { host: HOST }, two: { host: `http://${HOST}/` } },
     } as JetKvmConfig;
     const mgr = new ConnectionManager(multi);
-    expect(mgr.session("one").auth).toBe(mgr.session("two").auth);
+    expect(mgr.session("one")).toBe(mgr.session("two"));
   });
 });

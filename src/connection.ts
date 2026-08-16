@@ -8,7 +8,7 @@
  */
 import { RTCPeerConnection, type RTCDataChannel } from "werift";
 import { JsonRpcClient, type RpcEvent } from "./rpc.ts";
-import { JetKvmError, clamp, redact, sdpCodec, sleep } from "./util.ts";
+import { abortable, JetKvmError, clamp, redact, sdpCodec, sleep } from "./util.ts";
 import { heldInputReleases } from "./input.ts";
 import {
   type DeviceConfig,
@@ -45,6 +45,7 @@ export class AuthState {
   private password: string | null = null;
   private passwordResolved = false;
   private lastRotationAt = 0;
+  private loginPromise: Promise<void> | null = null;
 
   constructor(private readonly dev: DeviceConfig) {}
 
@@ -56,7 +57,6 @@ export class AuthState {
     return splitOrigin(this.dev.host).hostname;
   }
 
-
   private ensurePassword(): string | null {
     if (this.passwordResolved) return this.password;
     this.passwordResolved = true;
@@ -64,7 +64,7 @@ export class AuthState {
     return this.password;
   }
 
-  async login(): Promise<void> {
+  private async performLogin(): Promise<void> {
     const password = this.ensurePassword();
     const resp = await fetch(`${this.origin}/auth/login-local`, {
       method: "POST",
@@ -85,14 +85,29 @@ export class AuthState {
     }
     const setCookies = resp.headers.getSetCookie();
     const token = setCookies
-      .map((c) => c.split(";")[0]!)
-      .find((c) => c.startsWith("authToken="));
+      .map((cookie) => cookie.split(";")[0]!)
+      .find((cookie) => cookie.startsWith("authToken="));
     // No authToken cookie => noPassword mode; endpoints work without it.
     // Cookie expiry is not tracked: the device rotates the token on any other
     // login, so a 401 (handled by authedFetch's single retry) is the real
     // expiry signal — not a timer.
-    this.lastRotationAt = Date.now();
     this.cookie = token ?? "";
+  }
+
+  /** Coalesce concurrent initial logins and 401 recovery into one rotation. */
+  login(): Promise<void> {
+    if (this.loginPromise) return this.loginPromise;
+    const pending = this.performLogin();
+    this.loginPromise = pending;
+    pending.then(
+      () => {
+        if (this.loginPromise === pending) this.loginPromise = null;
+      },
+      () => {
+        if (this.loginPromise === pending) this.loginPromise = null;
+      },
+    );
+    return pending;
   }
 
   /** Token-rotation heuristic (DESIGN §3.4 tier 3): did a 401-relogin happen? */
@@ -106,26 +121,37 @@ export class AuthState {
    */
   async authedFetch(path: string, init: RequestInit = {}, opts: { retryOn401?: boolean } = {}): Promise<Response> {
     if (this.cookie === null) {
-      await this.login();
+      await abortable(this.login(), init.signal ?? undefined, "authenticated request aborted");
     }
-    const doFetch = (): Promise<Response> =>
-      fetch(`${this.origin}${path}`, {
-        ...init,
-        headers: {
-          ...(init.headers as Record<string, string> | undefined),
-          // The device aggressively resets pooled connections (observed as
-          // stackless ECONNREFUSED escaping Bun's keep-alive pool inside the
-          // omp process and killing the session). One-shot sockets only.
-          Connection: "close",
-          ...(this.cookie ? { Cookie: this.cookie } : {}),
-        },
-      });
-    const resp = await doFetch();
-    if (resp.status === 401 && opts.retryOn401 !== false) {
-      await this.login();
-      return doFetch();
+    const doFetch = async (cookie: string | null): Promise<Response> => {
+      const headers = new Headers(init.headers);
+      // The device aggressively resets pooled connections (observed as
+      // stackless ECONNREFUSED escaping Bun's keep-alive pool inside the omp
+      // process and killing the session). One-shot sockets only.
+      headers.set("Connection", "close");
+      if (cookie) headers.set("Cookie", cookie);
+      try {
+        return await fetch(`${this.origin}${path}`, { ...init, headers });
+      } catch (err) {
+        if (init.signal?.aborted) {
+          throw new JetKvmError("Aborted", "authenticated request aborted");
+        }
+        throw err;
+      }
+    };
+
+    const attemptedCookie = this.cookie;
+    const resp = await doFetch(attemptedCookie);
+    if (resp.status !== 401 || opts.retryOn401 === false) return resp;
+
+    // Another concurrent request may already have replaced the rejected
+    // cookie. Only the request that still sees its attempted cookie performs
+    // the login; every other request reuses that new token.
+    if (this.cookie === attemptedCookie) {
+      await abortable(this.login(), init.signal ?? undefined, "authenticated request aborted");
     }
-    return resp;
+    this.lastRotationAt = Date.now();
+    return doFetch(this.cookie);
   }
 }
 
@@ -287,20 +313,27 @@ export class DeviceSession {
     this.claim = null;
   }
 
-  async ensureConnected(): Promise<JsonRpcClient> {
+  async ensureConnected(signal?: AbortSignal): Promise<JsonRpcClient> {
+    if (signal?.aborted) {
+      throw new JetKvmError("Aborted", "connection attempt aborted");
+    }
     if (this.state === "connected" && this.rpc && this.dc?.readyState === "open") {
       return this.rpc;
     }
-    if (this.connectPromise) {
-      await this.connectPromise;
-      if (this.rpc) return this.rpc;
+    let pending = this.connectPromise;
+    if (!pending) {
+      pending = this.connect();
+      this.connectPromise = pending;
+      pending.then(
+        () => {
+          if (this.connectPromise === pending) this.connectPromise = null;
+        },
+        () => {
+          if (this.connectPromise === pending) this.connectPromise = null;
+        },
+      );
     }
-    this.connectPromise = this.connect();
-    try {
-      await this.connectPromise;
-    } finally {
-      this.connectPromise = null;
-    }
+    await abortable(pending, signal, "connection attempt aborted");
     if (!this.rpc) throw new JetKvmError("ConnectionLost", "connection attempt finished without a channel");
     return this.rpc;
   }
@@ -327,6 +360,10 @@ export class DeviceSession {
         reject(new JetKvmError("ConnectionLost", "rpc datachannel closed during connect"));
       };
     });
+    // A slow signaling request can let the open timeout reject before the
+    // code reaches `await opened`; attach a handler now to avoid an unhandled
+    // rejection while preserving the later await's error.
+    void opened.catch(() => {});
     const rpc = new JsonRpcClient((text) => dc.send(text), this.cfg.session.rpcTimeoutMs);
     dc.onMessage.subscribe((data) => {
       this.lastActivity = Date.now();
@@ -408,7 +445,7 @@ export class DeviceSession {
    * retryOnReconnect — replaying HID events is worse than failing.
    */
   async call(method: string, params: Record<string, unknown> = {}, opts: SessionCallOptions = {}): Promise<unknown> {
-    let client = await this.ensureConnected();
+    let client = await this.ensureConnected(opts.signal);
     try {
       return await client.call(method, params, { timeoutMs: opts.timeoutMs, signal: opts.signal });
     } catch (err) {
@@ -417,17 +454,17 @@ export class DeviceSession {
       if (err.code !== "ConnectionLost" && err.code !== "RpcTimeout") throw err;
       await this.teardown(`reconnect after ${err.code}`);
       this.backoffAttempt = 0;
-      client = await this.ensureConnected();
+      client = await this.ensureConnected(opts.signal);
       return client.call(method, params, { timeoutMs: opts.timeoutMs, signal: opts.signal });
     }
   }
 
   /** Current pointer extent (stream pixels) for coordinate mapping. */
-  async videoDims(): Promise<{ width: number; height: number }> {
+  async videoDims(signal?: AbortSignal): Promise<{ width: number; height: number }> {
     if (this.videoState.width && this.videoState.height) {
       return { width: this.videoState.width, height: this.videoState.height };
     }
-    const vs = (await this.call("getVideoState", {}, { retryOnReconnect: true })) as VideoState;
+    const vs = (await this.call("getVideoState", {}, { retryOnReconnect: true, signal })) as VideoState;
     this.videoState = { ...this.videoState, ...vs };
     if (!vs.width || !vs.height) {
       throw new JetKvmError(
@@ -484,11 +521,12 @@ export class ConnectionManager {
 
   session(deviceName?: string): DeviceSession {
     const dev = resolveDevice(this.cfg, deviceName);
-    const existing = registry().sessions.get(dev.host);
+    const key = splitOrigin(dev.host).origin;
+    const existing = registry().sessions.get(key);
     if (existing) return existing;
     const name = deviceName ?? "default";
     const session = new DeviceSession(name, dev, this.cfg);
-    registry().sessions.set(dev.host, session);
+    registry().sessions.set(key, session);
     return session;
   }
 

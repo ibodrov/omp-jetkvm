@@ -8,7 +8,7 @@
  * invariant (§4.3): abort/error/timeout mid-transaction releases all held
  * keys and buttons before the call returns.
  */
-import { JetKvmError, clamp, pixelToHid, sleep } from "./util.ts";
+import { abortable, JetKvmError, clamp, pixelToHid, sleep } from "./util.ts";
 import type { DeviceSession } from "./connection.ts";
 
 // ---------------------------------------------------------------------------
@@ -234,55 +234,67 @@ export async function runInputTransaction<T>(
   // queue-timeout (InputBusy) must not leave a cross-process claim behind
   // for a transaction that never ran. The claim is session-scoped once
   // acquired — released at teardown.
-  await session.ensureConnected();
-  const release = await session.locks.input.acquire(holder);
-  const held: HeldState = { modifierMask: 0, keyUsages: [], buttons: 0, pointer: { x: 0, y: 0 } };
+  await session.ensureConnected(opts.signal);
+  const release = await session.locks.input.acquire(holder, opts.signal);
+  const held: HeldState = {
+    modifierMask: 0,
+    keyUsages: [],
+    buttons: 0,
+    pointer: session.lastMouse ?? { x: 0, y: 0 },
+  };
   const warnings: string[] = [];
   const startedAt = Date.now();
 
-  const abortableSleep = async (ms: number): Promise<void> => {
-    if (opts.signal?.aborted) throw new JetKvmError("Aborted", "input transaction aborted");
-    await Promise.race([
-      sleep(ms),
-      new Promise<never>((_, reject) => {
-        if (!opts.signal) return;
-        opts.signal.addEventListener(
-          "abort",
-          () => reject(new JetKvmError("Aborted", "input transaction aborted")),
-          { once: true },
-        );
-      }),
-    ]);
-  };
 
   const tx: InputTransaction = {
+    abortableSleep(ms) {
+      return abortable(sleep(Math.max(0, ms)), opts.signal, "input transaction aborted");
+    },
     async keyboardReport(modifierMask, usages) {
-      await session.call("keyboardReport", { modifier: modifierMask, keys: hidKeysPayload(usages) });
+      const nextUsages = usages.filter((usage) => usage !== 0);
+      // A report can reach the device even when its response is lost. Mark
+      // newly held state before sending; clear old state only after a release
+      // report is acknowledged, so finally always sends a safe zero report on
+      // ambiguous failures.
+      if (modifierMask !== 0 || nextUsages.length > 0) {
+        held.modifierMask = modifierMask;
+        held.keyUsages = nextUsages;
+      }
+      await session.call(
+        "keyboardReport",
+        { modifier: modifierMask, keys: hidKeysPayload(usages) },
+        { signal: opts.signal },
+      );
       held.modifierMask = modifierMask;
-      held.keyUsages = usages.filter((u) => u !== 0);
+      held.keyUsages = nextUsages;
     },
     async mouseReport(x, y, buttons) {
-      await session.call("absMouseReport", { x, y, buttons });
-      session.lastMouse = { x, y };
-      held.buttons = buttons;
       held.pointer = { x, y };
+      session.lastMouse = { x, y };
+      if (buttons !== 0) held.buttons = buttons;
+      await session.call("absMouseReport", { x, y, buttons }, { signal: opts.signal });
+      held.buttons = buttons;
     },
     async wheelReport(wheelY, wheelX = 0) {
-      await session.call("wheelReport", { wheelY, wheelX });
+      await session.call("wheelReport", { wheelY, wheelX }, { signal: opts.signal });
     },
-    abortableSleep,
   };
 
   try {
     session.ensureClaim(opts.force);
     await foreignInputCheck(session, warnings);
+    if (opts.signal?.aborted) {
+      throw new JetKvmError("Aborted", "input transaction aborted");
+    }
     if (session.auth.tokenRotatedRecently(startedAt - 60_000)) {
       warnings.push("auth token rotated recently — another client (browser UI?) may be active");
     }
     const result = await fn(tx);
     return { result, warnings };
   } finally {
-    // Cleanup invariant: release exactly what we hold, best-effort, before unlock.
+    // Cleanup invariant: release anything that may have reached the device,
+    // best-effort, before unlock. Cleanup intentionally ignores the caller's
+    // aborted signal.
     try {
       if (held.modifierMask !== 0 || held.keyUsages.length > 0) {
         await session.call("keyboardReport", { modifier: 0, keys: hidKeysPayload([]) });
@@ -350,6 +362,13 @@ export function prepareText(text: string): string {
 export async function typeText(tx: InputTransaction, opts: TypeOptions): Promise<{ chars: number }> {
   const text = prepareText(opts.text);
   const delay = opts.keystrokeDelayMs ?? 25;
+  const settle = opts.settleMs ?? 120;
+  if (!Number.isFinite(delay) || delay < 0 || delay > 5_000) {
+    throw new JetKvmError("BadParams", "keystrokeDelayMs must be between 0 and 5000");
+  }
+  if (!Number.isFinite(settle) || settle < 0 || settle > 60_000) {
+    throw new JetKvmError("BadParams", "settleMs must be between 0 and 60000");
+  }
   let chars = 0;
   for (const ch of text) {
     const mapped = CHAR_USAGE[ch]!;
@@ -360,12 +379,15 @@ export async function typeText(tx: InputTransaction, opts: TypeOptions): Promise
     await tx.abortableSleep(delay);
     chars++;
   }
-  await tx.abortableSleep(opts.settleMs ?? 120);
+  await tx.abortableSleep(settle);
   return { chars };
 }
 
 export async function pressChord(tx: InputTransaction, chord: Chord, durationMs = 60): Promise<void> {
-  const hold = Math.max(40, durationMs); // never shorter than 40ms (auto-repeat, DESIGN §4.3)
+  if (!Number.isFinite(durationMs)) {
+    throw new JetKvmError("BadParams", "durationMs must be a finite number");
+  }
+  const hold = clamp(Math.max(40, durationMs), 40, 5_000);
   // Modifiers down, staggered 10ms each.
   const orderedBits = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80];
   for (const bit of orderedBits) {
@@ -374,12 +396,12 @@ export async function pressChord(tx: InputTransaction, chord: Chord, durationMs 
       await tx.abortableSleep(10);
     }
   }
-  if (chord.modifierMask !== 0) await tx.keyboardReport(chord.modifierMask, []);
-  for (const usage of chord.usages) {
-    await tx.keyboardReport(chord.modifierMask, [usage]);
+  // Non-modifier usages in one chord are held together, matching the HID
+  // report contract (up to six simultaneous keys), not tapped sequentially.
+  if (chord.modifierMask !== 0 || chord.usages.length > 0) {
+    await tx.keyboardReport(chord.modifierMask, chord.usages);
     await tx.abortableSleep(hold);
     await tx.keyboardReport(chord.modifierMask, []);
-    await tx.abortableSleep(10);
   }
   if (chord.modifierMask !== 0) {
     await tx.abortableSleep(10);
@@ -393,10 +415,11 @@ export interface ClickOptions {
   button?: keyof typeof MOUSE_BUTTONS;
   modifiers?: string[];
   double?: boolean;
+  signal?: AbortSignal;
 }
 
 export async function clickAt(tx: InputTransaction, session: DeviceSession, opts: ClickOptions): Promise<void> {
-  const dims = await session.videoDims();
+  const dims = await session.videoDims(opts.signal);
   const hx = pixelToHid(opts.x, dims.width);
   const hy = pixelToHid(opts.y, dims.height);
   const bit = MOUSE_BUTTONS[opts.button ?? "left"];
@@ -433,11 +456,12 @@ export interface DragOptions {
   x2: number;
   y2: number;
   steps?: number;
+  signal?: AbortSignal;
 }
 
 export async function dragTo(tx: InputTransaction, session: DeviceSession, opts: DragOptions): Promise<void> {
-  const dims = await session.videoDims();
-  const steps = Math.max(2, opts.steps ?? 12);
+  const dims = await session.videoDims(opts.signal);
+  const steps = clamp(Math.round(opts.steps ?? 12), 2, 120);
   const h1x = pixelToHid(opts.x1, dims.width);
   const h1y = pixelToHid(opts.y1, dims.height);
   const h2x = pixelToHid(opts.x2, dims.width);
@@ -460,9 +484,9 @@ export async function dragTo(tx: InputTransaction, session: DeviceSession, opts:
 export async function scrollAt(
   tx: InputTransaction,
   session: DeviceSession,
-  opts: { x: number; y: number; dy: number; dx?: number },
+  opts: { x: number; y: number; dy: number; dx?: number; signal?: AbortSignal },
 ): Promise<void> {
-  const dims = await session.videoDims();
+  const dims = await session.videoDims(opts.signal);
   await tx.mouseReport(pixelToHid(opts.x, dims.width), pixelToHid(opts.y, dims.height), 0);
   await tx.abortableSleep(20);
   const dyTotal = clamp(Math.round(opts.dy), -127, 127);

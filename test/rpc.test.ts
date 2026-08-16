@@ -82,4 +82,27 @@ describe("JsonRpcClient framing", () => {
     ac.abort();
     await expect(p).rejects.toThrow(/caller aborted/);
   });
+  test("already-aborted calls send no frame", async () => {
+    const { client, sent } = harness();
+    const controller = new AbortController();
+    controller.abort();
+    await expect(client.call("ping", {}, { signal: controller.signal })).rejects.toThrow(/caller aborted/);
+    expect(sent).toEqual([]);
+  });
+
+  test("malformed error payload rejects instead of wedging", async () => {
+    const { client } = harness();
+    const pending = client.call("ping", {}, { timeoutMs: 1_000 });
+    client.handleMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, error: null }));
+    await expect(pending).rejects.toThrow(/malformed device error/);
+  });
+
+  test("non-object frames are ignored safely", async () => {
+    const { client } = harness();
+    const pending = client.call("ping");
+    client.handleMessage("null");
+    client.handleMessage(JSON.stringify({ jsonrpc: "2.0", id: 1, result: "pong" }));
+    expect(await pending).toBe("pong");
+  });
+
 });

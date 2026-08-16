@@ -5,7 +5,7 @@
 import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { JetKvmError, humanBytes, pixelToHid } from "./util.ts";
+import { abortable, JetKvmError, humanBytes, pixelToHid } from "./util.ts";
 import type { JetKvmConfig } from "./config.ts";
 import { resolveDevice } from "./config.ts";
 import { ConnectionManager, type DeviceSession } from "./connection.ts";
@@ -55,12 +55,17 @@ export interface ToolExecuteCtx {
   /** Live session model, when the host provides it (capability gating). */
   model?: { input?: string[] };
 }
+export type ToolApprovalLike =
+  | "read"
+  | "write"
+  | "exec"
+  | ((args: unknown) => "read" | "write" | "exec");
 export interface ToolDefinitionLike {
   name: string;
   label: string;
   description: string;
   parameters: ZodObjectLike;
-  approval?: "read" | "write" | "exec";
+  approval?: ToolApprovalLike;
   loadMode?: "discoverable" | "essential";
   execute: (
     toolCallId: string,
@@ -78,10 +83,40 @@ export interface RegisterToolFn {
   (def: ToolDefinitionLike): void;
 }
 
-// Process-global engine cache: one warm engine per device host.
+const STORAGE_READ_ACTIONS: Record<string, true> = {
+  state: true,
+  space: true,
+  list_files: true,
+};
+
+function storageApproval(args: unknown): "read" | "write" | "exec" {
+  const input = typeof args === "object" && args !== null ? (args as Record<string, unknown>) : {};
+  const action = String(input["action"] ?? "");
+  if (STORAGE_READ_ACTIONS[action]) return "read";
+  if (action === "delete_file") return "exec";
+  return "write";
+}
+
+function deviceApproval(args: unknown): "read" | "write" | "exec" {
+  const input = typeof args === "object" && args !== null ? (args as Record<string, unknown>) : {};
+  const action = String(input["action"] ?? "");
+  if (action === "status" || action === "video") return "read";
+  if (action === "power") {
+    const op = input["op"];
+    return op === "atx-state" || op === "dc-state" ? "read" : "exec";
+  }
+  if (action === "usb") return input["enabled"] === undefined ? "read" : "exec";
+  if (action === "keyboard_layout") return input["layout"] === undefined ? "read" : "write";
+  if (action === "wake") return "exec";
+  return "exec";
+}
+
+// Process-global engine cache: one warm engine per device/config. Promises
+// coalesce concurrent first captures so duplicate Chromium processes cannot
+// leak past the cache miss.
 const ENGINES_KEY = Symbol.for("omp-jetkvm.engines");
-function engineRegistry(): Map<string, ScreenshotEngine> {
-  const g = globalThis as Record<symbol, Map<string, ScreenshotEngine> | undefined>;
+function engineRegistry(): Map<string, Promise<ScreenshotEngine>> {
+  const g = globalThis as Record<symbol, Map<string, Promise<ScreenshotEngine>> | undefined>;
   if (!g[ENGINES_KEY]) g[ENGINES_KEY] = new Map();
   return g[ENGINES_KEY]!;
 }
@@ -90,14 +125,23 @@ export async function engineFor(cfg: JetKvmConfig, deviceName?: string): Promise
   const dev = resolveDevice(cfg, deviceName);
   const mgr = new ConnectionManager(cfg);
   const session = mgr.session(deviceName);
-  // Key includes the configured engine so browser/recorder configs coexist.
-  const cacheKey = `${dev.host}::${cfg.screenshot.engine}`;
-  let engine = engineRegistry().get(cacheKey);
-  if (!engine) {
-    engine = await selectEngine(cfg, dev);
-    engineRegistry().set(cacheKey, engine);
+  const cacheKey = JSON.stringify([
+    session.auth.origin,
+    cfg.screenshot.engine,
+    cfg.screenshot.chromiumPath,
+    cfg.screenshot.recorderPath,
+    cfg.screenshot.idleTimeoutMs,
+  ]);
+  const registry = engineRegistry();
+  let pending = registry.get(cacheKey);
+  if (!pending) {
+    pending = selectEngine(cfg, dev).catch((err) => {
+      if (registry.get(cacheKey) === pending) registry.delete(cacheKey);
+      throw err;
+    });
+    registry.set(cacheKey, pending);
   }
-  return { engine, session };
+  return { engine: await pending, session };
 }
 
 function text(t: string): { type: string; text: string } {
@@ -117,7 +161,10 @@ function err(errLike: unknown): { content: { type: string; text?: string }[]; de
 }
 
 export async function disposeEngines(): Promise<void> {
-  for (const [, e] of engineRegistry()) await e.dispose();
+  for (const [, pending] of engineRegistry()) {
+    const engine = await pending;
+    await engine.dispose();
+  }
   engineRegistry().clear();
 }
 
@@ -147,8 +194,8 @@ export function buildScreenshotTool(cfg: JetKvmConfig, z: ZodLike): ToolDefiniti
       try {
         const deviceName = (params["device"] as string | undefined) ?? undefined;
         const action = (params["action"] as string) ?? "capture";
-        const { engine, session } = await engineFor(cfg, deviceName);
         if (action === "state") {
+          const session = new ConnectionManager(cfg).session(deviceName);
           const vs = await session.call("getVideoState", {}, { retryOnReconnect: true, signal });
           return {
             content: [text(`video state: ${JSON.stringify(vs)}`)],
@@ -159,7 +206,23 @@ export function buildScreenshotTool(cfg: JetKvmConfig, z: ZodLike): ToolDefiniti
         const format = (params["format"] as "jpeg" | "png" | undefined) ?? "jpeg";
         const quality = (params["quality"] as number | undefined) ?? 75;
         const maxModelWidth = (params["maxModelWidth"] as number | undefined) ?? cfg.screenshot.maxModelWidth;
-        if (waitMs > 0) await new Promise((r) => setTimeout(r, waitMs));
+        if (!Number.isFinite(waitMs) || waitMs < 0 || waitMs > 300_000) {
+          throw new JetKvmError("BadParams", "waitMs must be between 0 and 300000");
+        }
+        if (!Number.isFinite(quality) || quality < 0 || quality > 100) {
+          throw new JetKvmError("BadParams", "quality must be between 0 and 100");
+        }
+        if (!Number.isFinite(maxModelWidth) || maxModelWidth < 1 || maxModelWidth > 8_192) {
+          throw new JetKvmError("BadParams", "maxModelWidth must be between 1 and 8192");
+        }
+        const { engine, session } = await engineFor(cfg, deviceName);
+        if (waitMs > 0) {
+          await abortable(
+            new Promise<void>((resolve) => setTimeout(resolve, waitMs)),
+            signal,
+            "screenshot wait aborted",
+          );
+        }
         onUpdate?.({ content: [text(`capturing via ${engine.name} engine...`)] });
         const cap = await engine.capture({ format, quality, maxModelWidth, signal });
         const dir = screenshotDir(cfg);
@@ -236,24 +299,33 @@ export function buildMouseTool(cfg: JetKvmConfig, z: ZodLike): ToolDefinitionLik
         // down/hold_keys.
         if (action === "down") {
           if (x === undefined || y === undefined) throw new JetKvmError("BadParams", "down needs x and y");
-          await session.ensureConnected();
-          const release = await session.locks.input.acquire(holder);
+          await session.ensureConnected(signal);
+          const release = await session.locks.input.acquire(holder, signal);
+          let attemptedHold: { x: number; y: number } | null = null;
           try {
             // Claim inside the try: an InputBusy timeout must not leave a
             // cross-process claim behind for a hold that never happened.
             session.ensureClaim(params["force"] as boolean | undefined);
-            const dims = await session.videoDims();
+            const dims = await session.videoDims(signal);
             const button = (params["button"] as keyof typeof MOUSE_BUTTONS) ?? "left";
             const hx = pixelToHid(x, dims.width);
             const hy = pixelToHid(y, dims.height);
-            await session.call("absMouseReport", { x: hx, y: hy, buttons: MOUSE_BUTTONS[button] });
-            session.lastMouse = { x: hx, y: hy };
+            attemptedHold = { x: hx, y: hy };
+            session.lastMouse = attemptedHold;
+            await session.call(
+              "absMouseReport",
+              { x: hx, y: hy, buttons: MOUSE_BUTTONS[button] },
+              { signal },
+            );
             registerHeldRelease(session, release);
             return {
               content: [text(`holding ${button} button at ${x},${y} — release with action up / release_all`)],
               details: { button, device: session.name },
             };
           } catch (e) {
+            if (attemptedHold) {
+              await session.call("absMouseReport", { ...attemptedHold, buttons: 0 }).catch(() => {});
+            }
             release();
             return err(e);
           }
@@ -279,7 +351,7 @@ export function buildMouseTool(cfg: JetKvmConfig, z: ZodLike): ToolDefinitionLik
             switch (action) {
               case "move": {
                 if (x === undefined || y === undefined) throw new JetKvmError("BadParams", "move needs x and y");
-                const dims = await session.videoDims();
+                const dims = await session.videoDims(signal);
                 await tx.mouseReport(pixelToHid(x, dims.width), pixelToHid(y, dims.height), 0);
                 return { moved: { x, y }, coordinateSpace: dims };
               }
@@ -292,12 +364,13 @@ export function buildMouseTool(cfg: JetKvmConfig, z: ZodLike): ToolDefinitionLik
                   button: (params["button"] as "left" | "middle" | "right") ?? "left",
                   modifiers: params["modifiers"] as string[] | undefined,
                   double: action === "double_click",
+                  signal,
                 });
                 return { clicked: { x, y, button: params["button"] ?? "left", double: action === "double_click" } };
               }
               case "right_click": {
                 if (x === undefined || y === undefined) throw new JetKvmError("BadParams", "right_click needs x and y");
-                await clickAt(tx, session, { x, y, button: "right" });
+                await clickAt(tx, session, { x, y, button: "right", signal });
                 return { clicked: { x, y, button: "right" } };
               }
               case "drag": {
@@ -308,13 +381,13 @@ export function buildMouseTool(cfg: JetKvmConfig, z: ZodLike): ToolDefinitionLik
                 if (x1 === undefined || y1 === undefined || x2 === undefined || y2 === undefined) {
                   throw new JetKvmError("BadParams", "drag needs x1,y1,x2,y2");
                 }
-                await dragTo(tx, session, { x1, y1, x2, y2, steps: params["steps"] as number | undefined });
+                await dragTo(tx, session, { x1, y1, x2, y2, steps: params["steps"] as number | undefined, signal });
                 return { dragged: { x1, y1, x2, y2 } };
               }
               case "scroll": {
                 if (x === undefined || y === undefined) throw new JetKvmError("BadParams", "scroll needs x and y");
                 const dy = (params["dy"] as number | undefined) ?? 0;
-                await scrollAt(tx, session, { x, y, dy, dx: params["dx"] as number | undefined });
+                await scrollAt(tx, session, { x, y, dy, dx: params["dx"] as number | undefined, signal });
                 return { scrolled: { x, y, dy, dx: params["dx"] ?? 0 } };
               }
               default:
@@ -363,24 +436,29 @@ export function buildKeyboardTool(cfg: JetKvmConfig, z: ZodLike): ToolDefinition
           // Manual hold mode: no auto-cleanup (caller must release_all / up).
           // Connect before taking the mutex (backoff sleeps must not hold
           // the input lock — see runInputTransaction).
-          const release = await session.locks.input.acquire(holder);
+          const chord = parseChord(String(params["keys"] ?? ""));
+          await session.ensureConnected(signal);
+          const release = await session.locks.input.acquire(holder, signal);
+          let mayBeHeld = false;
           try {
             // Claim inside the try: an InputBusy timeout must not leave a
             // cross-process claim behind for a hold that never happened.
             session.ensureClaim(params["force"] as boolean | undefined);
-            const chord = parseChord(String(params["keys"] ?? ""));
-            if (chord.usages.length === 0) {
-              // modifier-only hold: just the mask
-              await session.call("keyboardReport", { modifier: chord.modifierMask, keys: hidKeysPayload([]) });
-            } else {
-              await session.call("keyboardReport", { modifier: chord.modifierMask, keys: hidKeysPayload(chord.usages) });
-            }
+            mayBeHeld = true;
+            await session.call(
+              "keyboardReport",
+              { modifier: chord.modifierMask, keys: hidKeysPayload(chord.usages) },
+              { signal },
+            );
             registerHeldRelease(session, release);
             return {
               content: [text(`holding "${params["keys"]}" — release with action up / release_all`)],
               details: { held: params["keys"], device: session.name },
             };
           } catch (e) {
+            if (mayBeHeld) {
+              await session.call("keyboardReport", { modifier: 0, keys: hidKeysPayload([]) }).catch(() => {});
+            }
             release();
             return err(e);
           }
@@ -441,7 +519,7 @@ export function buildStorageTool(cfg: JetKvmConfig, z: ZodLike): ToolDefinitionL
     label: "JetKVM storage",
     description:
       "Virtual media on the JetKVM. state/space/list_files are read-only. mount_url mounts a device-reachable HTTP URL; serve_and_mount serves a local file via the interface facing the device (needs the server alive while mounted); upload_and_mount copies into device flash then mounts (durable for unattended installs); upload stores without mounting (reserves a free-space margin: max(5% of file, 64 MiB) — tune with minFreeBytes); mount_file mounts an uploaded file; unmount clears the single media slot; check_url pre-flights a mount URL; delete_file removes a device file.",
-    approval: "write",
+    approval: storageApproval,
     loadMode: "discoverable",
     parameters: z.object({
       device: z.optional(z.string()),
@@ -467,15 +545,15 @@ export function buildStorageTool(cfg: JetKvmConfig, z: ZodLike): ToolDefinitionL
         // Read-only actions: no locks.
         switch (action) {
           case "state": {
-            const state = await getMountState(session);
+            const state = await getMountState(session, signal);
             return { content: [text(`virtual media: ${state === null ? "nothing mounted" : JSON.stringify(state)}`)], details: { state, serve: serveSnapshot(session) } };
           }
           case "space": {
-            const space = await getSpace(session);
+            const space = await getSpace(session, signal);
             return { content: [text(`storage: ${humanBytes(space.bytesFree)} free of ${humanBytes(space.bytesUsed + space.bytesFree)}`)], details: space };
           }
           case "list_files": {
-            const { files } = await listFiles(session);
+            const { files } = await listFiles(session, signal);
             const lines = files.map((f) => `  ${f.filename}  ${humanBytes(f.size)}  ${f.createdAt}`);
             return {
               content: [text(files.length ? `device files:\n${lines.join("\n")}` : "no files on device storage")],
@@ -483,7 +561,9 @@ export function buildStorageTool(cfg: JetKvmConfig, z: ZodLike): ToolDefinitionL
             };
           }
           case "check_url": {
-            const check = (await session.call("checkMountUrl", { url: String(params["url"] ?? "") }, { timeoutMs: 15_000, signal })) as Record<string, unknown>;
+            const url = String(params["url"] ?? "");
+            if (!url) throw new JetKvmError("BadParams", "check_url needs url");
+            const check = (await session.call("checkMountUrl", { url }, { timeoutMs: 15_000, signal })) as Record<string, unknown>;
             return { content: [text(`mount URL check: ${JSON.stringify(check)}`)], details: { check } };
           }
           default:
@@ -494,8 +574,8 @@ export function buildStorageTool(cfg: JetKvmConfig, z: ZodLike): ToolDefinitionL
         // reconnect backoff must not hold the storage lock), mutex next,
         // claim inside the try: a StorageBusy timeout must not leave a
         // cross-process claim behind.
-        await session.ensureConnected();
-        const release = await session.locks.storage.acquire(holder);
+        await session.ensureConnected(signal);
+        const release = await session.locks.storage.acquire(holder, signal);
         try {
           session.ensureClaim(params["force"] as boolean | undefined);
           switch (action) {
@@ -508,7 +588,7 @@ export function buildStorageTool(cfg: JetKvmConfig, z: ZodLike): ToolDefinitionL
             case "mount_url": {
               const url = String(params["url"] ?? "");
               if (!url) throw new JetKvmError("BadParams", "mount_url needs url");
-              const r = await mountUrl(session, cfg.policy, { url, mode });
+              const r = await mountUrl(session, cfg.policy, { url, mode, signal });
               return { content: [text(`mounted ${url} (${mode ?? "CDROM"})`)], details: { ...r, state: await getMountState(session) } };
             }
             case "serve_and_mount": {
@@ -571,7 +651,7 @@ export function buildDeviceTool(cfg: JetKvmConfig, z: ZodLike): ToolDefinitionLi
     label: "JetKVM device",
     description:
       "Device-level control. status: aggregated info (HTTP + RPC). video: getVideoState. power: op atx-short|atx-long|atx-reset (200ms/5s press, reset) or read via atx-state; wake: Wake-on-LAN (mac optional); usb: emulation state incl. getUsbDevices; keyboard_layout: read/set device keyboard layout. Power/USB-disconnect are policy-gated (jetkvm.policy).",
-    approval: "read",
+    approval: deviceApproval,
     loadMode: "discoverable",
     parameters: z.object({
       device: z.optional(z.string()),
@@ -589,7 +669,7 @@ export function buildDeviceTool(cfg: JetKvmConfig, z: ZodLike): ToolDefinitionLi
         const action = params["action"] as string;
         switch (action) {
           case "status": {
-            const status = await getDeviceStatus(session);
+            const status = await getDeviceStatus(session, signal);
             const atx = status.atxState as { power?: boolean } | null;
             return {
               content: [text(`device ${session.auth.hostname}: fw ${JSON.stringify(status.localVersion)}; ${atx?.power === true ? "host POWERED ON" : atx?.power === false ? "host powered off" : "host power unknown"}; video ${JSON.stringify(status.videoState)}; layout ${JSON.stringify(status.keyboardLayout)}; media ${JSON.stringify(status.virtualMedia)}`)],
@@ -604,34 +684,39 @@ export function buildDeviceTool(cfg: JetKvmConfig, z: ZodLike): ToolDefinitionLi
             const op = params["op"] as string | undefined;
             if (op === undefined) throw new JetKvmError("BadParams", "power needs op: atx-short | atx-long | atx-reset | atx-state | dc-state");
             if (op === "atx-state") {
-              const atx = await session.call("getATXState", {}, { retryOnReconnect: true });
+              const atx = await session.call("getATXState", {}, { retryOnReconnect: true, signal });
               return { content: [text(`ATX state: ${JSON.stringify(atx)}`)], details: { atxState: atx } };
             }
             if (op === "dc-state") {
-              const dc = await session.call("getDCPowerState", {}, { retryOnReconnect: true });
+              const dc = await session.call("getDCPowerState", {}, { retryOnReconnect: true, signal });
               return { content: [text(`DC power state: ${JSON.stringify(dc)}`)], details: { dcState: dc } };
             }
+            await session.ensureConnected(signal);
             session.ensureClaim(params["force"] as boolean | undefined);
             const r = await atxPowerAction(session, op as "atx-short" | "atx-long" | "atx-reset");
             return { content: [text(`ATX ${op} sent; state now ${JSON.stringify(r.atxState)}`)], details: r };
           }
           case "wake": {
             const mac = params["mac"] as string | undefined;
+            await session.ensureConnected(signal);
+            session.ensureClaim(params["force"] as boolean | undefined);
             const r = await wakeHost(session, mac);
             return { content: [text(`wake sent: ${JSON.stringify(r)}`)], details: r };
           }
           case "usb": {
             const enabled = params["enabled"] as boolean | undefined;
             if (enabled === undefined) {
-              const state = await session.call("getUSBState", {}, { retryOnReconnect: true });
+              const state = await session.call("getUSBState", {}, { retryOnReconnect: true, signal });
               let devices: unknown = null;
               try {
-                devices = await session.call("getUsbDevices", {}, { retryOnReconnect: true });
-              } catch {
+                devices = await session.call("getUsbDevices", {}, { retryOnReconnect: true, signal });
+              } catch (err) {
+                if (err instanceof JetKvmError && err.code === "Aborted") throw err;
                 devices = null;
               }
               return { content: [text(`USB emulation: ${JSON.stringify(state)}; devices: ${JSON.stringify(devices)}`)], details: { usbState: state, devices } };
             }
+            await session.ensureConnected(signal);
             session.ensureClaim(params["force"] as boolean | undefined);
             const r = await setUsbEmulation(session, enabled);
             return { content: [text(`USB emulation set to ${enabled}; state: ${JSON.stringify(r.usbState)}`)], details: r };
@@ -639,9 +724,11 @@ export function buildDeviceTool(cfg: JetKvmConfig, z: ZodLike): ToolDefinitionLi
           case "keyboard_layout": {
             const layout = params["layout"] as string | undefined;
             if (layout === undefined) {
-              const cur = await session.call("getKeyboardLayout", {}, { retryOnReconnect: true });
+              const cur = await session.call("getKeyboardLayout", {}, { retryOnReconnect: true, signal });
               return { content: [text(`device keyboard layout: ${JSON.stringify(cur)}`)], details: { layout: cur } };
             }
+            await session.ensureConnected(signal);
+            session.ensureClaim(params["force"] as boolean | undefined);
             await session.call("setKeyboardLayout", { layout });
             return { content: [text(`device keyboard layout set to ${layout}`)], details: { layout } };
           }

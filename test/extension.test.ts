@@ -10,12 +10,17 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 
 interface RegisteredTool {
   name: string;
+  approval?: "read" | "write" | "exec" | ((args: unknown) => "read" | "write" | "exec");
   execute: (toolCallId: string, params: Record<string, unknown>) => Promise<{
     content: { type: string; text?: string }[];
     isError?: boolean;
   }>;
 }
 
+
+function approvalTier(tool: RegisteredTool, args: Record<string, unknown>): "read" | "write" | "exec" | undefined {
+  return typeof tool.approval === "function" ? tool.approval(args) : tool.approval;
+}
 function fakePi(): { tools: RegisteredTool[]; pi: Parameters<typeof jetkvmExtension>[0] } {
   const tools: RegisteredTool[] = [];
   // Leaves carry a method-form .optional(): the factory re-wraps it as a
@@ -84,6 +89,15 @@ describe("extension factory", () => {
       const { tools, pi } = fakePi();
       await jetkvmExtension(pi);
       expect(tools.length).toBe(5);
+      const storage = tools.find((tool) => tool.name === "jetkvm_storage")!;
+      expect(approvalTier(storage, { action: "state" })).toBe("read");
+      expect(approvalTier(storage, { action: "mount_url" })).toBe("write");
+      expect(approvalTier(storage, { action: "delete_file" })).toBe("exec");
+      const device = tools.find((tool) => tool.name === "jetkvm_device")!;
+      expect(approvalTier(device, { action: "status" })).toBe("read");
+      expect(approvalTier(device, { action: "power", op: "atx-short" })).toBe("exec");
+      expect(approvalTier(device, { action: "usb" })).toBe("read");
+      expect(approvalTier(device, { action: "keyboard_layout", layout: "en-US" })).toBe("write");
       const shot = tools.find((t) => t.name === "jetkvm_screenshot")!;
       const r = await shot.execute("id", { action: "state" });
       expect(r.isError).toBe(true);

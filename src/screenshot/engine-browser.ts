@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import puppeteer from "puppeteer-core";
 import type { Browser, Page } from "puppeteer-core";
-import { JetKvmError } from "../util.ts";
+import { abortable, JetKvmError } from "../util.ts";
 import type { DeviceConfig, JetKvmConfig } from "../config.ts";
 import type { AuthState } from "../connection.ts";
 import { sharedAuthState } from "../connection.ts";
@@ -46,10 +46,11 @@ export class BrowserEngine implements ScreenshotEngine {
   readonly name = "browser";
   private browser: Browser | null = null;
   private page: Page | null = null;
+  private pagePromise: Promise<Page> | null = null;
   private chromiumProc: ChildProcess | null = null;
   private chromiumDir: string | null = null;
   private bridgeServer: ReturnType<typeof Bun.serve> | null = null;
-  private idleTimer: Timer | null = null;
+  private idleTimer: Timer | undefined;
   private connecting: Promise<void> | null = null;
   private lastCaptureAt = 0;
   private readonly auth: AuthState;
@@ -84,7 +85,7 @@ export class BrowserEngine implements ScreenshotEngine {
   }
 
   private armIdleKill(): void {
-    if (this.idleTimer !== null) clearTimeout(this.idleTimer);
+    clearTimeout(this.idleTimer);
     this.idleTimer = setTimeout(() => {
       void this.dispose().catch(() => {});
     }, this.cfg.screenshot.idleTimeoutMs);
@@ -99,12 +100,27 @@ export class BrowserEngine implements ScreenshotEngine {
    * browser announces `DevTools listening on ws://...` on stderr with
    * --remote-debugging-port=0; we parse and connect.
    */
-  private async ensurePage(): Promise<Page> {
+  private ensurePage(): Promise<Page> {
+    if (this.page && this.browser) return Promise.resolve(this.page);
+    if (this.pagePromise) return this.pagePromise;
+    const pending = this.launchPage();
+    this.pagePromise = pending;
+    pending.then(
+      () => {
+        if (this.pagePromise === pending) this.pagePromise = null;
+      },
+      () => {
+        if (this.pagePromise === pending) this.pagePromise = null;
+      },
+    );
+    return pending;
+  }
+
+  private async launchPage(): Promise<Page> {
     if (this.page && this.browser) return this.page;
     const userDir = mkdtempSync(join(tmpdir(), "omp-jetkvm-chromium-"));
     const args = [
       "--headless=new",
-      "--no-sandbox",
       "--no-first-run",
       "--mute-audio",
       "--autoplay-policy=no-user-gesture-required",
@@ -113,7 +129,7 @@ export class BrowserEngine implements ScreenshotEngine {
       "--remote-debugging-port=0",
       "about:blank",
     ];
-    const child = spawn(this.chromiumPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(this.chromiumPath, args, { stdio: ["ignore", "ignore", "pipe"] });
     this.chromiumProc = child;
     this.chromiumDir = userDir;
     const { promise, resolve } = Promise.withResolvers<string | Error>();
@@ -130,7 +146,7 @@ export class BrowserEngine implements ScreenshotEngine {
       resolve(v);
     };
     child.stderr!.on("data", (d: Buffer) => {
-      stderrTail += String(d);
+      stderrTail = (stderrTail + String(d)).slice(-8_192);
       const m = /DevTools listening on (ws:\/\/\S+)/.exec(stderrTail);
       if (m) settle(m[1]!);
     });
@@ -216,22 +232,39 @@ export class BrowserEngine implements ScreenshotEngine {
     this.armIdleKill();
     // Screenshots must reflect the CURRENT screen: accept a decoded frame at
     // most 5s old; otherwise rebuild the session (fresh IDR on connect).
-    const page = await this.ensureConnected(5_000);
+    const page = await abortable(
+      this.ensureConnected(5_000),
+      opts.signal,
+      "screenshot capture aborted",
+    );
     let r: BridgeResult;
     try {
-      r = (await page.evaluate(
-        (o: { format: string; quality: number; maxModelWidth: number }) =>
-          window.__jetkvm.capture(o),
-        { format: opts.format, quality: opts.quality, maxModelWidth: opts.maxModelWidth },
+      r = (await abortable(
+        page.evaluate(
+          (o: { format: string; quality: number; maxModelWidth: number }) =>
+            window.__jetkvm.capture(o),
+          { format: opts.format, quality: opts.quality, maxModelWidth: opts.maxModelWidth },
+        ),
+        opts.signal,
+        "screenshot capture aborted",
       )) as BridgeResult;
     } catch (err) {
+      if (err instanceof JetKvmError && err.code === "Aborted") throw err;
       // Stream went stale (host reboot, resolution change): reconnect once.
       await this.closePage();
-      const fresh = await this.ensureConnected();
-      r = (await fresh.evaluate(
-        (o: { format: string; quality: number; maxModelWidth: number }) =>
-          window.__jetkvm.capture(o),
-        { format: opts.format, quality: opts.quality, maxModelWidth: opts.maxModelWidth },
+      const fresh = await abortable(
+        this.ensureConnected(),
+        opts.signal,
+        "screenshot capture aborted",
+      );
+      r = (await abortable(
+        fresh.evaluate(
+          (o: { format: string; quality: number; maxModelWidth: number }) =>
+            window.__jetkvm.capture(o),
+          { format: opts.format, quality: opts.quality, maxModelWidth: opts.maxModelWidth },
+        ),
+        opts.signal,
+        "screenshot capture aborted",
       )) as BridgeResult;
     }
     this.lastCaptureAt = Date.now();
@@ -292,8 +325,10 @@ export class BrowserEngine implements ScreenshotEngine {
   }
 
   async dispose(): Promise<void> {
-    if (this.idleTimer !== null) clearTimeout(this.idleTimer);
-    this.idleTimer = null;
+    clearTimeout(this.idleTimer);
+    this.idleTimer = undefined;
+    const launching = this.pagePromise;
+    if (launching) await launching.catch(() => {});
     await this.closePage();
     if (this.bridgeServer) {
       this.bridgeServer.stop(true);

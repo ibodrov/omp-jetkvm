@@ -44,6 +44,14 @@ describe("AsyncMutex", () => {
     r3();
     expect(m.holderInfo.held).toBe(false);
   });
+  test("pre-aborted waiters fail without entering the queue", async () => {
+    const mutex = new AsyncMutex("input", 1_000);
+    const controller = new AbortController();
+    controller.abort();
+    await expect(mutex.acquire("cancelled", controller.signal)).rejects.toThrow(/aborted/);
+    expect(mutex.holderInfo.held).toBe(false);
+  });
+
 });
 
 describe("parseRange (serve_and_mount)", () => {
@@ -113,6 +121,47 @@ describe("config", () => {
     rmSync(tmp, { recursive: true, force: true });
   });
 
+  test("project config overrides user config", () => {
+    rmSync(tmp, { recursive: true, force: true });
+    mkdirSync(`${tmp}/.omp/agent`, { recursive: true });
+    writeFileSync(
+      `${tmp}/.omp/agent/config.yml`,
+      ["jetkvm:", "  devices:", "    default:", "      host: 10.0.0.1", "  session:", "    rpcTimeoutMs: 1000"].join("\n"),
+    );
+    writeFileSync(
+      `${tmp}/.omp/config.yml`,
+      ["jetkvm:", "  devices:", "    default:", "      host: 10.0.0.2", "  session:", "    rpcTimeoutMs: 2000"].join("\n"),
+    );
+    const previousHome = process.env.HOME;
+    process.env.HOME = tmp;
+    resetConfigCache();
+    try {
+      const cfg = loadJetKvmConfig(tmp);
+      expect(cfg.devices["default"]?.host).toBe("10.0.0.2");
+      expect(cfg.session.rpcTimeoutMs).toBe(2000);
+    } finally {
+      process.env.HOME = previousHome;
+      resetConfigCache();
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("invalid nested config fails at load time", () => {
+    rmSync(tmp, { recursive: true, force: true });
+    mkdirSync(`${tmp}/.omp`, { recursive: true });
+    writeFileSync(`${tmp}/.omp/config.yml`, ["jetkvm:", "  screenshot: null"].join("\n"));
+    const previousHome = process.env.HOME;
+    process.env.HOME = tmp;
+    resetConfigCache();
+    try {
+      expect(() => loadJetKvmConfig(tmp)).toThrow(/jetkvm\.screenshot must be a mapping/);
+    } finally {
+      process.env.HOME = previousHome;
+      resetConfigCache();
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   test("resolveDevice names the problem when unconfigured", () => {
     rmSync(tmp, { recursive: true, force: true });
     mkdirSync(tmp, { recursive: true });
@@ -151,6 +200,18 @@ describe("cross-process claim liveness (pid reuse)", () => {
     claim.release();
     expect(peekCrossProcessClaim("claim-test.local")).toBeNull();
   });
+
+  test("a second live claim is rejected synchronously", () => {
+    const first = acquireCrossProcessClaim("claim-contention-test.local", { enabled: true });
+    try {
+      expect(() =>
+        acquireCrossProcessClaim("claim-contention-test.local", { enabled: true }),
+      ).toThrow(/claimed/);
+    } finally {
+      first.release();
+    }
+  });
+
   test("same pid but wrong start time reads as dead (pid was recycled)", () => {
     expect(holderIsLive({ pid: process.pid, since: 0, startTicks: 999_999_999 })).toBe(false);
   });

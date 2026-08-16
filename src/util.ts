@@ -41,6 +41,30 @@ export const sdpCodec = {
 
 export const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
+/** Await an operation without retaining abort listeners on long-lived signals. */
+export function abortable<T>(operation: Promise<T>, signal: AbortSignal | undefined, message: string): Promise<T> {
+  if (!signal) return operation;
+  if (signal.aborted) return Promise.reject(new JetKvmError("Aborted", message));
+  return new Promise<T>((resolve, reject) => {
+    const detach = (): void => signal.removeEventListener("abort", onAbort);
+    const onAbort = (): void => {
+      detach();
+      reject(new JetKvmError("Aborted", message));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    operation.then(
+      (value) => {
+        detach();
+        resolve(value);
+      },
+      (err) => {
+        detach();
+        reject(err);
+      },
+    );
+  });
+}
+
 export function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
 }
@@ -50,7 +74,11 @@ export function clamp(v: number, lo: number, hi: number): number {
  * DESIGN §3.3: `hid = round(clamp(x, 0, W-1) / (W-1) * 32767)` per axis.
  */
 export function pixelToHid(v: number, extent: number): number {
-  const max = Math.max(1, extent - 1);
+  if (!Number.isFinite(v) || !Number.isFinite(extent) || extent < 1) {
+    throw new JetKvmError("BadCoordinate", "mouse coordinates and video dimensions must be finite positive numbers");
+  }
+  if (extent === 1) return 0;
+  const max = extent - 1;
   return Math.round((clamp(Math.round(v), 0, max) / max) * 32767);
 }
 
@@ -94,16 +122,19 @@ export async function routeSourceAddress(
   hostname: string,
   opts: { timeoutMs?: number; signal?: AbortSignal } = {},
 ): Promise<string | null> {
+  if (opts.signal?.aborted) return null;
   const sock = createSocket("udp4");
   const { promise, resolve } = Promise.withResolvers<string | null>();
   let settled = false;
   // A hung DNS lookup must not block serve_and_mount forever.
   const timer = setTimeout(() => done(null), opts.timeoutMs ?? 5_000);
   timer.unref?.();
+  const onAbort = (): void => done(null);
   const done = (ip: string | null): void => {
     if (settled) return;
     settled = true;
     clearTimeout(timer);
+    opts.signal?.removeEventListener("abort", onAbort);
     try {
       sock.close();
     } catch {
@@ -124,7 +155,7 @@ export async function routeSourceAddress(
         : null;
     done(ip);
   });
-  opts.signal?.addEventListener("abort", () => done(null), { once: true });
+  opts.signal?.addEventListener("abort", onAbort, { once: true });
   return promise;
 }
 

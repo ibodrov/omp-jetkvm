@@ -9,7 +9,6 @@
  * Tier 3 (cross-machine) is detection-only; see input.ts / status reporting.
  */
 import { mkdirSync, writeFileSync, unlinkSync, existsSync, readFileSync, openSync, closeSync } from "node:fs";
-import net from "node:net";
 import os from "node:os";
 import { JetKvmError } from "./util.ts";
 
@@ -17,6 +16,7 @@ interface Waiter {
   holder: string;
   grant: () => void;
   timer: Timer;
+  detachAbort: () => void;
 }
 
 /**
@@ -34,18 +34,37 @@ export class AsyncMutex {
     private readonly queueTimeoutMs: number,
   ) {}
 
-  acquire(holder: string): Promise<() => void> {
+  acquire(holder: string, signal?: AbortSignal): Promise<() => void> {
+    if (signal?.aborted) {
+      return Promise.reject(new JetKvmError("Aborted", `${this.kind} transaction aborted while waiting for the lock`));
+    }
     if (!this.locked && this.queue.length === 0) {
       this.lockNow(holder);
       return Promise.resolve(this.releaseBind());
     }
     return new Promise<() => void>((resolve, reject) => {
-      const waiter: Waiter = {
+      let waiter: Waiter;
+      const remove = (): boolean => {
+        const idx = this.queue.indexOf(waiter);
+        if (idx < 0) return false;
+        this.queue.splice(idx, 1);
+        clearTimeout(waiter.timer);
+        waiter.detachAbort();
+        return true;
+      };
+      const onAbort = (): void => {
+        if (remove()) {
+          reject(new JetKvmError("Aborted", `${this.kind} transaction aborted while waiting for the lock`));
+        }
+      };
+      waiter = {
         holder,
-        grant: () => resolve(this.releaseBind()),
+        grant: () => {
+          waiter.detachAbort();
+          resolve(this.releaseBind());
+        },
         timer: setTimeout(() => {
-          const idx = this.queue.indexOf(waiter);
-          if (idx >= 0) this.queue.splice(idx, 1);
+          if (!remove()) return;
           reject(
             new JetKvmError(`${this.kind === "input" ? "Input" : "Storage"}Busy`, `${this.kind} transaction could not start: held by ${this.currentHolder} since ${new Date(this.heldSince).toISOString()}`, {
               holder: this.currentHolder,
@@ -54,7 +73,9 @@ export class AsyncMutex {
             }),
           );
         }, this.queueTimeoutMs),
+        detachAbort: () => signal?.removeEventListener("abort", onAbort),
       };
+      signal?.addEventListener("abort", onAbort, { once: true });
       this.queue.push(waiter);
     });
   }
@@ -173,12 +194,27 @@ function pidAlive(pid: number): boolean {
  */
 export function acquireCrossProcessClaim(hostname: string, opts: { enabled: boolean; force?: boolean }): CrossProcessClaim {
   const info: ClaimInfo = { pid: process.pid, since: Date.now(), startTicks: pidStartTicks(process.pid) };
-  const server = net.createServer();
+  if (!opts.enabled) {
+    return { info, release() {} };
+  }
 
+  const path = infoFilePath(hostname);
   if (process.platform === "linux") {
     const abstractName = `\0omp-jetkvm:${hostname}`;
+    let listener: { stop(closeActiveConnections?: boolean): void };
     try {
-      server.listen(abstractName);
+      // Bun.listen binds synchronously. node:net.Server.listen reports
+      // EADDRINUSE asynchronously, which would let two callers both believe
+      // they acquired the claim before crashing on an unhandled error.
+      listener = Bun.listen({
+        unix: abstractName,
+        socket: {
+          open(socket) {
+            socket.end();
+          },
+          data() {},
+        },
+      });
     } catch (err) {
       const existing = readInfo(hostname);
       const holder = existing && holderIsLive(existing) ? existing : null;
@@ -188,48 +224,40 @@ export function acquireCrossProcessClaim(hostname: string, opts: { enabled: bool
           since: holder.since,
         });
       }
-      // Stale (crashed holder) or forced steal: remove the sidecar, retry once.
-      try {
-        unlinkSync(infoFilePath(hostname));
-      } catch {
-        // best effort
+      if (holder) {
+        throw new JetKvmError("DeviceBusy", `cannot force-steal a live cross-process claim (pid ${holder.pid} holds the kernel socket); stop that process or set crossProcess: none`, { holderPid: holder.pid });
       }
-      if (!opts.force && !holder) {
-        // Abstract socket busy but no info file: unknown holder; be conservative
-        // only when enabled — this is our own second process without sidecar.
-        try {
-          server.listen(abstractName);
-        } catch {
-          throw new JetKvmError("DeviceBusy", `device ${hostname} is claimed by another process on this machine (no claim record; pid unknown)`, { hostname });
-        }
-      } else {
-        // forced steal against a live holder is not possible with abstract
-        // sockets (we cannot kick their bind); refuse with instructions.
-        if (holder) {
-          throw new JetKvmError("DeviceBusy", `cannot force-steal a live cross-process claim (pid ${holder.pid} holds the kernel socket); stop that process or set crossProcess: none`, { holderPid: holder.pid });
-        }
-      }
+      throw new JetKvmError("DeviceBusy", `device ${hostname} is claimed by another process on this machine (no live claim record; pid unknown)`, {
+        hostname,
+        cause: err instanceof Error ? err.message : String(err),
+      });
     }
-    writeFileSync(infoFilePath(hostname), JSON.stringify(info));
+    try {
+      writeFileSync(path, JSON.stringify(info));
+    } catch (err) {
+      listener.stop(true);
+      throw err;
+    }
+    let released = false;
     return {
       info,
       release() {
+        if (released) return;
+        released = true;
+        // Remove the sidecar while the kernel socket is still held. Stopping
+        // first lets a new owner create its sidecar before this owner unlinks
+        // it, erasing the new holder's diagnostics.
         try {
-          server.close();
-        } catch {
-          // already closed
-        }
-        try {
-          unlinkSync(infoFilePath(hostname));
+          unlinkSync(path);
         } catch {
           // already gone
         }
+        listener.stop(true);
       },
     };
   }
 
   // Non-Linux: O_EXCL lockfile + pid liveness.
-  const path = infoFilePath(hostname);
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const fd = openSync(path, "wx");

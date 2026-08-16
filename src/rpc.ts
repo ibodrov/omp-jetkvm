@@ -48,22 +48,30 @@ export class JsonRpcClient {
    */
   handleMessage(data: string | Buffer): void {
     if (this.closed) return; // close() rejects all pending; late frames are junk
-    let msg: Record<string, unknown>;
+    let parsed: unknown;
     try {
-      msg = JSON.parse(String(data));
+      parsed = JSON.parse(String(data));
     } catch {
       return; // ignore malformed frames; never wedge on junk
     }
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return;
+    const msg = parsed as Record<string, unknown>;
     const id = typeof msg["id"] === "number" ? msg["id"] : undefined;
     if (id !== undefined && this.pending.has(id)) {
       const entry = this.pending.get(id)!;
       this.pending.delete(id);
       clearTimeout(entry.timer);
       if (msg["error"] !== undefined) {
-        const err = msg["error"] as { code?: number; message?: string };
+        const rawError = msg["error"];
+        const error =
+          typeof rawError === "object" && rawError !== null
+            ? (rawError as Record<string, unknown>)
+            : {};
+        const deviceCode = typeof error["code"] === "number" ? error["code"] : undefined;
+        const deviceMessage = typeof error["message"] === "string" ? error["message"] : "malformed device error";
         entry.reject(
-          new JetKvmError("RpcError", `${entry.method}: ${err.message ?? "unknown device error"}`, {
-            deviceCode: err.code,
+          new JetKvmError("RpcError", `${entry.method}: ${deviceMessage}`, {
+            deviceCode,
             method: entry.method,
           }),
         );
@@ -97,6 +105,9 @@ export class JsonRpcClient {
    */
   call(method: string, params: Record<string, unknown> = {}, opts: RpcCallOptions = {}): Promise<unknown> {
     const timeoutMs = opts.timeoutMs ?? this.defaultTimeoutMs;
+    if (opts.signal?.aborted) {
+      return Promise.reject(new JetKvmError("Aborted", `${method}: caller aborted`));
+    }
     if (this.closed) {
       return Promise.reject(new JetKvmError("ConnectionLost", `${method}: channel closed (${this.closed})`));
     }
