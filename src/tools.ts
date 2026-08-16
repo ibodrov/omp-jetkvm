@@ -9,7 +9,7 @@ import { JetKvmError, humanBytes, pixelToHid } from "./util.ts";
 import type { JetKvmConfig } from "./config.ts";
 import { resolveDevice } from "./config.ts";
 import { ConnectionManager, type DeviceSession } from "./connection.ts";
-import { heldInputReleases, registerHeldRelease } from "./input.ts";
+import { registerHeldRelease, releaseAllInput } from "./input.ts";
 import {
   clickAt,
   dragTo,
@@ -202,7 +202,7 @@ export function buildMouseTool(cfg: JetKvmConfig, z: ZodLike): ToolDefinitionLik
     name: "jetkvm_mouse",
     label: "JetKVM mouse",
     description:
-      "Mouse input on the remote host. Coordinates are stream pixels — the same space as the screenshot (details.coordinateSpace). Actions: move, click (left/middle/right, modifiers, double via double_click), right_click, drag (x1,y1 -> x2,y2), scroll (dy notches, +up/-down), down/up for custom holds.",
+      "Mouse input on the remote host. Coordinates are stream pixels — the same space as the screenshot (details.coordinateSpace). Actions: move, click (left/middle/right, modifiers, double via double_click), right_click, drag (x1,y1 -> x2,y2), scroll (dy notches, +up/-down), down/up. down holds the button (like keyboard down) until up / release_all — releases ALL held input; up's x/y are optional and default to the last pointer position.",
     approval: "write",
     loadMode: "discoverable",
     parameters: z.object({
@@ -227,12 +227,55 @@ export function buildMouseTool(cfg: JetKvmConfig, z: ZodLike): ToolDefinitionLik
         const session = new ConnectionManager(cfg).session(deviceName);
         const action = params["action"] as string;
         const holder = `omp:${toolCallId.slice(0, 12)}`;
+        const x = params["x"] as number | undefined;
+        const y = params["y"] as number | undefined;
+
+        // down: manual hold — the transaction cleanup invariant must not
+        // release it at call end (that made "down" a slow click). Park the
+        // mutex release until up / release_all, exactly like keyboard
+        // down/hold_keys.
+        if (action === "down") {
+          if (x === undefined || y === undefined) throw new JetKvmError("BadParams", "down needs x and y");
+          await session.ensureConnected();
+          const release = await session.locks.input.acquire(holder);
+          try {
+            // Claim inside the try: an InputBusy timeout must not leave a
+            // cross-process claim behind for a hold that never happened.
+            session.ensureClaim(params["force"] as boolean | undefined);
+            const dims = await session.videoDims();
+            const button = (params["button"] as keyof typeof MOUSE_BUTTONS) ?? "left";
+            const hx = pixelToHid(x, dims.width);
+            const hy = pixelToHid(y, dims.height);
+            await session.call("absMouseReport", { x: hx, y: hy, buttons: MOUSE_BUTTONS[button] });
+            session.lastMouse = { x: hx, y: hy };
+            registerHeldRelease(session, release);
+            return {
+              content: [text(`holding ${button} button at ${x},${y} — release with action up / release_all`)],
+              details: { button, device: session.name },
+            };
+          } catch (e) {
+            release();
+            return err(e);
+          }
+        }
+
+        // up: escape hatch like keyboard release_all — deliberately NOT under
+        // the input mutex (a parked hold would deadlock it). Releases all
+        // held input; the mouse report goes to x,y when given, else the last
+        // known pointer position (never a corner teleport).
+        if (action === "up") {
+          const at =
+            x !== undefined && y !== undefined
+              ? await session.videoDims().then((dims) => ({ x: pixelToHid(x, dims.width), y: pixelToHid(y, dims.height) }))
+              : undefined;
+          await releaseAllInput(session, at);
+          return { content: [text("released all held input (keys and buttons)")], details: { device: session.name } };
+        }
+
         const { result, warnings } = await runInputTransaction(
           session,
           holder,
           async (tx) => {
-            const x = params["x"] as number | undefined;
-            const y = params["y"] as number | undefined;
             switch (action) {
               case "move": {
                 if (x === undefined || y === undefined) throw new JetKvmError("BadParams", "move needs x and y");
@@ -274,15 +317,6 @@ export function buildMouseTool(cfg: JetKvmConfig, z: ZodLike): ToolDefinitionLik
                 await scrollAt(tx, session, { x, y, dy, dx: params["dx"] as number | undefined });
                 return { scrolled: { x, y, dy, dx: params["dx"] ?? 0 } };
               }
-              case "down":
-              case "up": {
-                if (x === undefined || y === undefined) throw new JetKvmError("BadParams", `${action} needs x and y`);
-                const button = (params["button"] as keyof typeof MOUSE_BUTTONS) ?? "left";
-                const dims = await session.videoDims();
-                const bit = action === "down" ? MOUSE_BUTTONS[button] : 0;
-                await tx.mouseReport(pixelToHid(x, dims.width), pixelToHid(y, dims.height), bit);
-                return { button, state: action === "down" ? "down" : "up", coordinateSpace: dims };
-              }
               default:
                 throw new JetKvmError("BadParams", `unknown mouse action "${action}"`);
             }
@@ -305,7 +339,7 @@ export function buildKeyboardTool(cfg: JetKvmConfig, z: ZodLike): ToolDefinition
     name: "jetkvm_keyboard",
     label: "JetKVM keyboard",
     description:
-      'Keyboard input on the remote host. type: US-layout text ("\n"=enter, "\t"=tab). press: chord notation "ctrl+alt+t", "enter", "shift+a", "win+r", "right-ctrl". down/up + hold_keys/release_all for manual holds (caller must release). Long text is slow (~25ms/char).',
+      'Keyboard input on the remote host. type: US-layout text ("\n"=enter, "\t"=tab); text is validated before typing — unmappable characters fail the whole call without typing a prefix, and "\r\n" collapses to a single enter. press: chord notation "ctrl+alt+t", "enter", "shift+a", "win+r", "right-ctrl". down/up + hold_keys/release_all for manual holds (caller must release; up/release_all also releases held mouse buttons at the last pointer position). Long text is slow (~25ms/char).',
     approval: "write",
     loadMode: "discoverable",
     parameters: z.object({
@@ -327,6 +361,8 @@ export function buildKeyboardTool(cfg: JetKvmConfig, z: ZodLike): ToolDefinition
 
         if (action === "down" || action === "hold_keys") {
           // Manual hold mode: no auto-cleanup (caller must release_all / up).
+          // Connect before taking the mutex (backoff sleeps must not hold
+          // the input lock — see runInputTransaction).
           const release = await session.locks.input.acquire(holder);
           try {
             // Claim inside the try: an InputBusy timeout must not leave a
@@ -354,11 +390,10 @@ export function buildKeyboardTool(cfg: JetKvmConfig, z: ZodLike): ToolDefinition
         // the mutex release, so acquiring here would deadlock until queue
         // timeout. This is the documented escape hatch — it can stomp a
         // concurrent transaction's held state, which is what "release ALL"
-        // means.
+        // means. The mouse release goes to the last known pointer position,
+        // so it never teleports the cursor to the corner.
         if (action === "up" || action === "release_all") {
-          await session.call("keyboardReport", { modifier: 0, keys: hidKeysPayload([]) });
-          await session.call("absMouseReport", { x: 0, y: 0, buttons: 0 });
-          for (const rel of heldInputReleases(session)) rel();
+          await releaseAllInput(session);
           return { content: [text("released all keys and buttons")], details: { device: session.name } };
         }
 
@@ -377,13 +412,6 @@ export function buildKeyboardTool(cfg: JetKvmConfig, z: ZodLike): ToolDefinition
                 keystrokeDelayMs: params["keystrokeDelayMs"] as number | undefined,
                 settleMs: params["settleMs"] as number | undefined,
               });
-              if (r.skipped.length > 0) {
-                throw new JetKvmError(
-                  "UnmappableChar",
-                  `cannot type ${r.skipped.map((c) => JSON.stringify(c)).join(", ")} on a US layout — use press with explicit keys, or check the host keyboard layout (getKeyboardLayout)`,
-                  { skipped: r.skipped },
-                );
-              }
               return { typed: r.chars };
             }
             if (action === "press") {
@@ -462,9 +490,11 @@ export function buildStorageTool(cfg: JetKvmConfig, z: ZodLike): ToolDefinitionL
             break;
         }
 
-        // Mutations: storage mutex + cross-process claim. Mutex first, claim
-        // inside the try (same reasoning as input): a StorageBusy timeout
-        // must not leave a cross-process claim behind.
+        // Mutations: storage mutex + cross-process claim. Connect first (a
+        // reconnect backoff must not hold the storage lock), mutex next,
+        // claim inside the try: a StorageBusy timeout must not leave a
+        // cross-process claim behind.
+        await session.ensureConnected();
         const release = await session.locks.storage.acquire(holder);
         try {
           session.ensureClaim(params["force"] as boolean | undefined);

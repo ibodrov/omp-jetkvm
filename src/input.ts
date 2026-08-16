@@ -88,8 +88,6 @@ export const CHAR_USAGE: Record<string, { usage: number; shift: boolean }> = (()
   for (const [ch, usage] of Object.entries(plain)) map[ch] = { usage, shift: false };
   for (const [ch, base] of Object.entries(shifted)) map[ch] = { usage: plain[base]!, shift: true };
   map["\n"] = { usage: KEY_USAGE.enter!, shift: false };
-  // \r\n text must not die on the carriage return (model output is full of it).
-  map["\r"] = { usage: KEY_USAGE.enter!, shift: false };
   map["\t"] = { usage: KEY_USAGE.tab!, shift: false };
   return map;
 })();
@@ -203,7 +201,7 @@ export const MOUSE_BUTTONS = { left: 1, right: 2, middle: 4 } as const;
  * pressed by someone else (human at the local UI, another machine) — surface
  * it as a warning so agents know the field isn't clean. Heuristic only.
  */
-async function foreignInputCheck(session: DeviceSession, warnings: string[]): Promise<void> {
+export async function foreignInputCheck(session: DeviceSession, warnings: string[]): Promise<void> {
   try {
     const down = (await session.call("getKeyDownState", {}, { timeoutMs: 3_000 })) as {
       modifier?: number;
@@ -230,9 +228,13 @@ export async function runInputTransaction<T>(
   fn: (tx: InputTransaction) => Promise<T>,
   opts: { signal?: AbortSignal; force?: boolean } = {},
 ): Promise<{ result: T; warnings: string[] }> {
-  // Mutex first, claim second: a queue-timeout (InputBusy) must not leave a
-  // cross-process claim behind for a transaction that never ran. The claim
-  // is session-scoped once acquired — released at teardown.
+  // Connect (including capped backoff sleeps) BEFORE taking the mutex: a
+  // down device must not hold the input lock — starving other agents into
+  // InputBusy — through a 30s reconnect backoff. Mutex next, claim last: a
+  // queue-timeout (InputBusy) must not leave a cross-process claim behind
+  // for a transaction that never ran. The claim is session-scoped once
+  // acquired — released at teardown.
+  await session.ensureConnected();
   const release = await session.locks.input.acquire(holder);
   const held: HeldState = { modifierMask: 0, keyUsages: [], buttons: 0, pointer: { x: 0, y: 0 } };
   const warnings: string[] = [];
@@ -261,6 +263,7 @@ export async function runInputTransaction<T>(
     },
     async mouseReport(x, y, buttons) {
       await session.call("absMouseReport", { x, y, buttons });
+      session.lastMouse = { x, y };
       held.buttons = buttons;
       held.pointer = { x, y };
     },
@@ -293,6 +296,26 @@ export async function runInputTransaction<T>(
     release();
   }
 }
+/**
+ * Full input release: zero keyboard + mouse reports, then drain parked
+ * manual-hold mutex releases. Deliberately NOT under the input mutex — a
+ * parked hold would deadlock it; this is the documented escape hatch, and
+ * "release ALL" is exactly its job. The mouse report goes to the last known
+ * pointer position (or `at`) so releasing never teleports the cursor.
+ */
+export async function releaseAllInput(session: DeviceSession, at?: { x: number; y: number }): Promise<void> {
+  // Best-effort device-side release; the drain must run even when the
+  // channel is already gone (the device times held keys out on disconnect).
+  try {
+    await session.call("keyboardReport", { modifier: 0, keys: hidKeysPayload([]) });
+    const p = at ?? session.lastMouse;
+    await session.call("absMouseReport", { x: p?.x ?? 0, y: p?.y ?? 0, buttons: 0 });
+  } catch {
+    // channel gone
+  }
+  for (const rel of heldInputReleases(session)) rel();
+}
+
 
 // ---------------------------------------------------------------------------
 // Higher-level operations (used by the tools)
@@ -304,16 +327,32 @@ export interface TypeOptions {
   settleMs?: number;
 }
 
-export async function typeText(tx: InputTransaction, opts: TypeOptions): Promise<{ chars: number; skipped: string[] }> {
+/**
+ * Normalize + validate typing input BEFORE any keypress leaves:
+ *  - `\r\n` and lone `\r` collapse to one enter (model text is full of CRLF;
+ *    both bytes mapping to enter would type it twice)
+ *  - unmappable characters throw up front — half-typed text followed by an
+ *    error invites a retry that duplicates the prefix.
+ */
+export function prepareText(text: string): string {
+  const normalized = text.replace(/\r\n?/g, "\n");
+  const unmappable = [...new Set([...normalized])].filter((ch) => !CHAR_USAGE[ch]);
+  if (unmappable.length > 0) {
+    throw new JetKvmError(
+      "UnmappableChar",
+      `cannot type ${unmappable.map((c) => JSON.stringify(c)).join(", ")} on a US layout — use press with explicit keys, or check the host keyboard layout (getKeyboardLayout)`,
+      { unmappable },
+    );
+  }
+  return normalized;
+}
+
+export async function typeText(tx: InputTransaction, opts: TypeOptions): Promise<{ chars: number }> {
+  const text = prepareText(opts.text);
   const delay = opts.keystrokeDelayMs ?? 25;
-  const skipped: string[] = [];
   let chars = 0;
-  for (const ch of opts.text) {
-    const mapped = CHAR_USAGE[ch];
-    if (!mapped) {
-      skipped.push(ch);
-      continue;
-    }
+  for (const ch of text) {
+    const mapped = CHAR_USAGE[ch]!;
     const mask = mapped.shift ? MODIFIER_ALIASES.shift! : 0;
     await tx.keyboardReport(mask, [mapped.usage]);
     await tx.abortableSleep(delay);
@@ -322,7 +361,7 @@ export async function typeText(tx: InputTransaction, opts: TypeOptions): Promise
     chars++;
   }
   await tx.abortableSleep(opts.settleMs ?? 120);
-  return { chars, skipped };
+  return { chars };
 }
 
 export async function pressChord(tx: InputTransaction, chord: Chord, durationMs = 60): Promise<void> {

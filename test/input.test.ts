@@ -1,5 +1,15 @@
 import { describe, expect, test } from "bun:test";
-import { CHAR_USAGE, hidKeysPayload, KEY_USAGE, MODIFIER_BITS, parseChord } from "../src/input.ts";
+import {
+  CHAR_USAGE,
+  foreignInputCheck,
+  hidKeysPayload,
+  KEY_USAGE,
+  MODIFIER_BITS,
+  parseChord,
+  prepareText,
+  typeText,
+  type InputTransaction,
+} from "../src/input.ts";
 import { JetKvmError, pixelToHid, routeSourceAddress, sdpCodec } from "../src/util.ts";
 
 describe("USB HID keymap (HID Usage Tables)", () => {
@@ -42,8 +52,8 @@ describe("USB HID keymap (HID Usage Tables)", () => {
     expect(CHAR_USAGE["|"]).toEqual({ usage: 0x31, shift: true });
     expect(CHAR_USAGE["{"]).toEqual({ usage: 0x2f, shift: true });
     expect(CHAR_USAGE["\n"]!.usage).toBe(0x28);
-    // \r maps to enter so \r\n text doesn't die on the carriage return
-    expect(CHAR_USAGE["\r"]).toEqual({ usage: 0x28, shift: false });
+    // \r is not mapped: prepareText collapses it so CRLF types one enter.
+    expect(CHAR_USAGE["\r"]).toBeUndefined();
     expect(CHAR_USAGE["\t"]!.usage).toBe(0x2b);
     expect(CHAR_USAGE[" "]!.usage).toBe(0x2c);
     expect(CHAR_USAGE["é"]).toBeUndefined();
@@ -142,5 +152,63 @@ describe("routeSourceAddress", () => {
   });
   test("unroutable/unresolvable host yields null, not a guess", async () => {
     expect(await routeSourceAddress("no-such-host.invalid")).toBe(null);
+  });
+});
+
+describe("prepareText / typeText", () => {
+  function recordingTx() {
+    const reports: { modifier: number; keys: number[] }[] = [];
+    const tx: InputTransaction = {
+      async keyboardReport(modifier, usages) {
+        reports.push({ modifier, keys: usages });
+      },
+      async mouseReport() {},
+      async wheelReport() {},
+      async abortableSleep() {},
+    };
+    return { tx, reports };
+  }
+
+  test("CRLF and lone CR collapse to a single enter", async () => {
+    const { tx, reports } = recordingTx();
+    const r = await typeText(tx, { text: "a\r\nb\rc", keystrokeDelayMs: 0, settleMs: 0 });
+    expect(r.chars).toBe(5); // a enter b enter c — one enter per line break
+    const enters = reports.filter((x) => x.keys[0] === 0x28);
+    expect(enters.length).toBe(2); // one per line break, not two per CRLF
+  });
+
+  test("unmappable chars fail the whole call before any keypress", async () => {
+    const { tx, reports } = recordingTx();
+    await expect(typeText(tx, { text: "abé", keystrokeDelayMs: 0, settleMs: 0 })).rejects.toThrow(JetKvmError);
+    expect(reports.length).toBe(0); // no prefix typed before the failure
+  });
+
+  test("prepareText names every unmappable char once", () => {
+    expect(() => prepareText("aé bé é")).toThrow(/"é"/);
+    expect(prepareText("plain ascii 123")).toBe("plain ascii 123");
+  });
+});
+
+describe("foreignInputCheck", () => {
+  test("warns on keys this session did not press", async () => {
+    const warnings: string[] = [];
+    const session = {
+      call: async () => ({ modifier: 2, keys: [0x04, 0, 0, 0, 0, 0] }),
+    };
+    await foreignInputCheck(session as unknown as Parameters<typeof foreignInputCheck>[0], warnings);
+    expect(warnings[0]).toMatch(/foreign input suspected/);
+  });
+
+  test("silent on a clean field and on a missing method", async () => {
+    const warnings: string[] = [];
+    const clean = { call: async () => ({ modifier: 0, keys: [0, 0, 0, 0, 0, 0] }) };
+    await foreignInputCheck(clean as unknown as Parameters<typeof foreignInputCheck>[0], warnings);
+    const absent = {
+      call: async () => {
+        throw new Error("method not found");
+      },
+    };
+    await foreignInputCheck(absent as unknown as Parameters<typeof foreignInputCheck>[0], warnings);
+    expect(warnings).toEqual([]);
   });
 });

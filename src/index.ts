@@ -18,6 +18,13 @@
 
 interface ToolDefinitionShape {
   name: string;
+  execute?: (
+    toolCallId: string,
+    params: Record<string, unknown>,
+    signal: AbortSignal,
+    onUpdate: unknown,
+    ctx: unknown,
+  ) => Promise<{ content: { type: string; text: string }[]; isError?: boolean }>;
 }
 
 interface JetKvmConfigShape {
@@ -28,7 +35,6 @@ interface JetKvmConfigShape {
 
 interface PolicyShape {
   allowPowerActions: boolean;
-  allowReboot: boolean;
   allowUsbDisconnect: boolean;
   forceUnmountOnMount: boolean;
 }
@@ -85,6 +91,17 @@ function moduleSpecifier(name: string): string {
   return `./${name}.ts`;
 }
 
+/** A broken config must not unregister the tool surface: register stubs that
+ *  surface the config error on every call (agent-visible, fixable). */
+function errorTool(def: ToolDefinitionShape, message: string): ToolDefinitionShape {
+  return {
+    ...def,
+    async execute() {
+      return { content: [{ type: "text", text: message }], isError: true };
+    },
+  };
+}
+
 export default async function jetkvmExtension(pi: PiLike): Promise<void> {
   const [configMod, connectionMod, interceptMod, toolsMod, storageMod, engineMod, recorderMod] = await Promise.all(
     ["config", "connection", "intercept", "tools", "storage", "screenshot/engine", "screenshot/engine-recorder"].map(
@@ -104,7 +121,7 @@ export default async function jetkvmExtension(pi: PiLike): Promise<void> {
   const buildDeviceTool = toolsMod.buildDeviceTool as (cfg: JetKvmConfigShape, z: unknown) => ToolDefinitionShape;
   const disposeEngines = toolsMod.disposeEngines as () => Promise<void>;
   const serveSnapshot = storageMod.serveSnapshot as (session: DeviceSessionShape) => Record<string, unknown> | null;
-  const stopServeServer = storageMod.stopServeServer as (session: DeviceSessionShape) => void;
+  const shutdownServe = storageMod.shutdownServe as (session: DeviceSessionShape) => Promise<void>;
   const findChromium = engineMod.findChromium as (explicit: string) => string | null;
   const findRecorderBin = recorderMod.findRecorderBin as (explicit: string) => string | null;
 
@@ -116,7 +133,21 @@ export default async function jetkvmExtension(pi: PiLike): Promise<void> {
     optional: (leaf: unknown): unknown => (leaf as ZodSchemaLike).optional(),
   };
 
-  const cfg = loadJetKvmConfig(process.cwd());
+  let cfg: JetKvmConfigShape;
+  let cfgError: string | null = null;
+  try {
+    cfg = loadJetKvmConfig(process.cwd());
+  } catch (err) {
+    // Parse/validation failures must not take the whole tool surface down;
+    // register tools that explain the problem on every call instead.
+    cfg = {
+      devices: {},
+      screenshot: { engine: "auto", chromiumPath: "", recorderPath: "" },
+      policy: { allowPowerActions: true, allowUsbDisconnect: false, forceUnmountOnMount: true },
+    };
+    cfgError = `omp-jetkvm config error: ${err instanceof Error ? err.message : String(err)}`;
+    pi.logger?.warn(cfgError);
+  }
   const deviceNames = Object.keys(cfg.devices).filter((k) => cfg.devices[k]?.host);
 
   if (deviceNames.length === 0) {
@@ -125,11 +156,16 @@ export default async function jetkvmExtension(pi: PiLike): Promise<void> {
     );
   }
 
-  pi.registerTool(buildScreenshotTool(cfg, z));
-  pi.registerTool(buildMouseTool(cfg, z));
-  pi.registerTool(buildKeyboardTool(cfg, z));
-  pi.registerTool(buildStorageTool(cfg, z));
-  pi.registerTool(buildDeviceTool(cfg, z));
+  const toolDefs = [
+    buildScreenshotTool(cfg, z),
+    buildMouseTool(cfg, z),
+    buildKeyboardTool(cfg, z),
+    buildStorageTool(cfg, z),
+    buildDeviceTool(cfg, z),
+  ];
+  for (const def of toolDefs) {
+    pi.registerTool(cfgError ? errorTool(def, `${cfgError} — fix the config and restart the session`) : def);
+  }
 
   pi.registerCommand("jetkvm", {
     description: "JetKVM status card (args: reconnect)",
@@ -142,6 +178,7 @@ export default async function jetkvmExtension(pi: PiLike): Promise<void> {
         return;
       }
       const lines: string[] = [];
+      if (cfgError) lines.push(cfgError);
       lines.push(deviceNames.length ? `devices: ${deviceNames.join(", ")}` : "devices: none configured");
       const chromium = findChromium(cfg.screenshot.chromiumPath);
       const recorder = findRecorderBin(cfg.screenshot.recorderPath);
@@ -171,7 +208,7 @@ export default async function jetkvmExtension(pi: PiLike): Promise<void> {
 
   pi.on("session_shutdown", async () => {
     for (const session of ConnectionManager.peekSessions()) {
-      stopServeServer(session);
+      await shutdownServe(session);
     }
     await ConnectionManager.disposeAll();
     await disposeEngines();

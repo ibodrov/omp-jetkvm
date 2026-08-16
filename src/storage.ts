@@ -173,6 +173,12 @@ export async function uploadFile(session: DeviceSession, opts: UploadOptions): P
     alreadyUploadedBytes: number;
     dataChannel: string;
   };
+  if (typeof start.dataChannel !== "string" || typeof start.alreadyUploadedBytes !== "number") {
+    throw new JetKvmError(
+      "UnexpectedResponse",
+      `startStorageFileUpload returned a malformed result: ${JSON.stringify(start).slice(0, 200)}`,
+    );
+  }
   const offset = Math.max(0, Math.min(start.alreadyUploadedBytes, stat.size));
   if (offset >= stat.size) {
     return { filename, totalBytes: stat.size, resumedFrom: offset, state: await getMountState(session) };
@@ -262,6 +268,48 @@ export function stopServeServer(session: DeviceSession): void {
   }
 }
 
+/**
+ * Retire a previous serve server safely: when the media it serves is still
+ * mounted, unmount FIRST (policy-aware) — a server death under an active
+ * mount wedges the device's storage handler (README "Firmware quirks").
+ * Policy refusal (VirtualMediaBusy) propagates and leaves the server alive.
+ */
+export async function retireServeServer(session: DeviceSession, policy: PolicyConfig): Promise<void> {
+  const entry = serveRegistry().get(session.auth.hostname);
+  if (!entry) return;
+  let state: VirtualMediaState | null = null;
+  try {
+    state = await getMountState(session);
+  } catch {
+    state = null; // device unreachable: stopping the server is all we can do
+  }
+  if (state?.url && state.url === entry.url) {
+    await clearSlot(session, policy);
+  }
+  stopServeServer(session);
+}
+
+/**
+ * session_shutdown path: best-effort unmount-then-stop, never throws. Force
+ * unmount here — the alternative is the server dying under an active mount,
+ * which is the documented device wedge.
+ */
+export async function shutdownServe(session: DeviceSession): Promise<void> {
+  try {
+    if (session.state === "connected") {
+      await retireServeServer(session, {
+        allowPowerActions: true,
+        allowUsbDisconnect: false,
+        forceUnmountOnMount: true,
+      });
+    }
+  } catch {
+    // device gone: process exit stops the server regardless
+  }
+  stopServeServer(session);
+}
+
+
 export async function serveAndMount(
   session: DeviceSession,
   policy: PolicyConfig,
@@ -276,14 +324,20 @@ export async function serveAndMount(
   // kernel's chosen source address for the route to it (multi-homed, VPN and
   // loopback-test setups all resolve correctly; no packets sent). Anything
   // else is a guess the device may not be able to route back to.
-  const bindIp = await routeSourceAddress(session.auth.hostname);
+  const bindIp = await routeSourceAddress(session.auth.hostname, { signal: opts.signal });
   if (!bindIp) {
+    if (opts.signal?.aborted) {
+      throw new JetKvmError("Aborted", "serve_and_mount aborted while resolving the route");
+    }
     throw new JetKvmError(
       "NoRouteToDevice",
       `no usable local address on the route to ${session.auth.hostname} — cannot serve virtual media; check connectivity or use upload_and_mount instead`,
     );
   }
-  stopServeServer(session);
+  // Unmount any media our previous server is still serving before stopping
+  // it (retireServeServer); a fresh server dying under a live mount is the
+  // documented wedge.
+  await retireServeServer(session, policy);
   const file: BunFile = Bun.file(path);
   const server = Bun.serve({
     hostname: bindIp,

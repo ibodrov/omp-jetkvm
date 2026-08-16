@@ -53,11 +53,25 @@ const CHROMIUM_CANDIDATES = [
   "/usr/bin/microsoft-edge",
 ];
 
+const CHROMIUM_BIN_NAMES = [
+  "chromium",
+  "chromium-browser",
+  "google-chrome-stable",
+  "google-chrome",
+  "google-chrome-unstable",
+  "microsoft-edge",
+];
+
 export function findChromium(explicitPath: string): string | null {
   if (explicitPath) return existsSync(explicitPath) ? explicitPath : null;
   for (const env of ["CHROME_PATH", "CHROMIUM_PATH", "OMP_JETKVM_CHROMIUM"]) {
     const v = process.env[env];
     if (v && existsSync(v)) return v;
+  }
+  // PATH lookup before absolute guesses — covers macOS/Homebrew/custom prefixes.
+  for (const name of CHROMIUM_BIN_NAMES) {
+    const p = Bun.which(name);
+    if (p) return p;
   }
   for (const p of CHROMIUM_CANDIDATES) {
     if (existsSync(p)) return p;
@@ -66,7 +80,12 @@ export function findChromium(explicitPath: string): string | null {
 }
 
 export async function selectEngine(cfg: JetKvmConfig, dev: DeviceConfig): Promise<ScreenshotEngine> {
-  const wanted = cfg.screenshot.engine;
+  // Config values are not schema-validated at load; catch unknowns here so
+  // a typo reports itself instead of silently falling through to "auto".
+  const wanted: string = cfg.screenshot.engine;
+  if (wanted !== "auto" && wanted !== "browser" && wanted !== "recorder") {
+    throw new JetKvmError("ConfigError", `unknown screenshot engine "${wanted}" — use auto, browser, or recorder`);
+  }
   if (wanted === "browser" || wanted === "auto") {
     const chromium = findChromium(cfg.screenshot.chromiumPath);
     if (chromium) {

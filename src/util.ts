@@ -90,13 +90,20 @@ export function humanBytes(n: number): string {
  * multi-homed hosts, VPN-routed devices, and loopback test setups correctly,
  * unlike a first-interface guess.
  */
-export async function routeSourceAddress(hostname: string): Promise<string | null> {
+export async function routeSourceAddress(
+  hostname: string,
+  opts: { timeoutMs?: number; signal?: AbortSignal } = {},
+): Promise<string | null> {
   const sock = createSocket("udp4");
   const { promise, resolve } = Promise.withResolvers<string | null>();
   let settled = false;
+  // A hung DNS lookup must not block serve_and_mount forever.
+  const timer = setTimeout(() => done(null), opts.timeoutMs ?? 5_000);
+  timer.unref?.();
   const done = (ip: string | null): void => {
     if (settled) return;
     settled = true;
+    clearTimeout(timer);
     try {
       sock.close();
     } catch {
@@ -117,6 +124,7 @@ export async function routeSourceAddress(hostname: string): Promise<string | nul
         : null;
     done(ip);
   });
+  opts.signal?.addEventListener("abort", () => done(null), { once: true });
   return promise;
 }
 

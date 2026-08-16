@@ -6,11 +6,13 @@
 import { RTCPeerConnection, type RTCDataChannel } from "werift";
 
 export interface FakeDeviceOptions {
-  /** Signals an in-memory transport instead of real ICE (unused for now). */
   state?: {
     videoWidth?: number;
     videoHeight?: number;
     atxPower?: boolean;
+    /** Keys another client holds (foreign-input check scenarios). */
+    heldKeys?: number[];
+    heldModifier?: number;
   };
 }
 
@@ -87,7 +89,8 @@ export class FakeDevice {
       case "getKeyboardLayout":
         return "en-US";
       case "getKeyDownState":
-        return [0, 0, 0, 0, 0, 0];
+        // Object form, like the firmware: {modifier, keys} (zero-padded 6).
+        return { modifier: this.opts.state?.heldModifier ?? 0, keys: this.opts.state?.heldKeys ?? [0, 0, 0, 0, 0, 0] };
       case "unmountImage":
       case "deleteStorageFile":
         return undefined;

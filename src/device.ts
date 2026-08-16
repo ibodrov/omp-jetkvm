@@ -1,6 +1,6 @@
 /**
  * Device-level operations: status, video, ATX power, WoL, USB. DESIGN §4.5.
- * Policy gates (allowPowerActions / allowReboot / allowUsbDisconnect) live in
+ * Policy gates (allowPowerActions / allowUsbDisconnect) live in
  * intercept.ts; this module is mechanics.
  */
 import { JetKvmError } from "./util.ts";

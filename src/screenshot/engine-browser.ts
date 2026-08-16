@@ -12,7 +12,7 @@ import type { Browser, Page } from "puppeteer-core";
 import { JetKvmError } from "../util.ts";
 import type { DeviceConfig, JetKvmConfig } from "../config.ts";
 import type { AuthState } from "../connection.ts";
-import { AuthState as AuthStateClass } from "../connection.ts";
+import { sharedAuthState } from "../connection.ts";
 import type { CaptureOptions, CaptureResult, ScreenshotEngine } from "./engine.ts";
 
 declare global {
@@ -59,7 +59,10 @@ export class BrowserEngine implements ScreenshotEngine {
     private readonly dev: DeviceConfig,
     private readonly cfg: JetKvmConfig,
   ) {
-    this.auth = new AuthStateClass(dev);
+    // Shared per-origin AuthState: a private instance would re-login and
+    // rotate the device's single token out from under the control session
+    // (every login invalidates the previous cookie).
+    this.auth = sharedAuthState(dev);
   }
 
   private bridgeUrl(): string {
@@ -173,7 +176,7 @@ export class BrowserEngine implements ScreenshotEngine {
     await page.evaluate((ms: number) => window.__jetkvm.waitFrame(ms), 15_000);
   }
 
-  private async ensureConnected(maxFrameAgeMs?: number): Promise<Page> {
+  private async ensureConnected(maxFrameAgeMs?: number, retryOnDeadPage = true): Promise<Page> {
     const page = await this.ensurePage();
     try {
       const state = (await page.evaluate("window.__jetkvm.state()")) as {
@@ -189,10 +192,11 @@ export class BrowserEngine implements ScreenshotEngine {
       if (state.frameReady) {
         await page.evaluate("window.__jetkvm.close()");
       }
-    } catch {
-      // page died; fall through to relaunch
+    } catch (err) {
+      // page died; relaunch once — a crash-looping page must not recurse forever
+      if (!retryOnDeadPage) throw err;
       await this.closePage();
-      return this.ensureConnected(maxFrameAgeMs);
+      return this.ensureConnected(maxFrameAgeMs, false);
     }
     if (!this.connecting) {
       this.connecting = this.connectBridge(page)

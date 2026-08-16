@@ -104,29 +104,36 @@ export class JsonRpcClient {
     const frame = JSON.stringify({ jsonrpc: "2.0", id, method, params });
 
     return new Promise<unknown>((resolve, reject) => {
-      const entry: Pending = {
-        method,
-        resolve,
-        reject,
-        timer: setTimeout(() => {
-          this.pending.delete(id);
-          reject(new JetKvmError("RpcTimeout", `${method}: no device response in ${timeoutMs}ms`, { method }));
-        }, timeoutMs),
+      // Detach the abort listener on every settle path — a long-lived signal
+      // reused across calls must not accumulate stale listeners.
+      const detach = (): void => opts.signal?.removeEventListener("abort", onAbort);
+      const settleResolve = (v: unknown): void => {
+        detach();
+        resolve(v);
       };
-      this.pending.set(id, entry);
-      const onAbort = () => {
+      const settleReject = (e: JetKvmError): void => {
+        detach();
+        reject(e);
+      };
+      const onAbort = (): void => {
         if (this.pending.delete(id)) {
-          clearTimeout(entry.timer);
-          reject(new JetKvmError("Aborted", `${method}: caller aborted`));
+          clearTimeout(timer);
+          settleReject(new JetKvmError("Aborted", `${method}: caller aborted`));
         }
       };
+      const timer: Timer = setTimeout(() => {
+        this.pending.delete(id);
+        settleReject(new JetKvmError("RpcTimeout", `${method}: no device response in ${timeoutMs}ms`, { method }));
+      }, timeoutMs);
+      const entry: Pending = { method, resolve: settleResolve, reject: settleReject, timer };
+      this.pending.set(id, entry);
       opts.signal?.addEventListener("abort", onAbort, { once: true });
       try {
         this.sendText(frame);
       } catch (err) {
         this.pending.delete(id);
-        clearTimeout(entry.timer);
-        reject(new JetKvmError("ConnectionLost", `${method}: send failed: ${String(err)}`));
+        clearTimeout(timer);
+        settleReject(new JetKvmError("ConnectionLost", `${method}: send failed: ${String(err)}`));
       }
     });
   }

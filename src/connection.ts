@@ -9,6 +9,7 @@
 import { RTCPeerConnection, type RTCDataChannel } from "werift";
 import { JsonRpcClient, type RpcEvent } from "./rpc.ts";
 import { JetKvmError, clamp, redact, sdpCodec, sleep } from "./util.ts";
+import { heldInputReleases } from "./input.ts";
 import {
   type DeviceConfig,
   type JetKvmConfig,
@@ -129,6 +130,32 @@ export class AuthState {
 }
 
 // ---------------------------------------------------------------------------
+// Process-global auth registry: one AuthState per device origin. The device
+// keeps a single server-side token that every login rotates; two AuthState
+// instances for one host (control session + browser engine) would invalidate
+// each other's cookie on every login and ping-pong 401 → re-login (and trip
+// the login rate limiter).
+// ---------------------------------------------------------------------------
+
+const AUTH_REGISTRY_KEY = Symbol.for("omp-jetkvm.auth");
+
+function authRegistry(): Map<string, AuthState> {
+  const g = globalThis as Record<symbol, Map<string, AuthState> | undefined>;
+  if (!g[AUTH_REGISTRY_KEY]) g[AUTH_REGISTRY_KEY] = new Map();
+  return g[AUTH_REGISTRY_KEY]!;
+}
+
+/** The process-wide AuthState for a device origin (first config wins). */
+export function sharedAuthState(dev: DeviceConfig): AuthState {
+  const key = splitOrigin(dev.host).origin;
+  let auth = authRegistry().get(key);
+  if (!auth) {
+    auth = new AuthState(dev);
+    authRegistry().set(key, auth);
+  }
+  return auth;
+}
+
 // DeviceSession
 // ---------------------------------------------------------------------------
 
@@ -158,16 +185,17 @@ export class DeviceSession {
   atxState: { power?: boolean; hdd?: boolean } = {};
   usbState: unknown = null;
   foreignInputWarnings: string[] = [];
-
+  /** Last mouse position we reported (HID space) — release paths use it
+   *  instead of (0,0) so releasing buttons never teleports the cursor. */
+  lastMouse: { x: number; y: number } | null = null;
   constructor(
     readonly name: string,
     readonly dev: DeviceConfig,
     private readonly cfg: JetKvmConfig,
   ) {
-    this.auth = new AuthState(dev);
+    this.auth = sharedAuthState(dev);
     this.locks = createDeviceLocks(cfg.concurrency.queueTimeoutMs);
   }
-
   get rpcClient(): JsonRpcClient | null {
     return this.rpc;
   }
@@ -239,6 +267,9 @@ export class DeviceSession {
     this.state = "idle";
     this.rpc?.close(reason);
     this.rpc = null;
+    // A dropped channel must not leave the input mutex locked by a parked
+    // manual hold (keyboard down/hold_keys, mouse down) — drain them.
+    for (const rel of heldInputReleases(this)) rel();
     try {
       this.dc?.close();
     } catch {
@@ -345,14 +376,9 @@ export class DeviceSession {
       // Track dc close after successful connect.
       dc.onclose = () => {
         if (this.state === "connected") {
-          this.state = "idle";
           this.backoffAttempt = 1;
           this.lastError = "datachannel closed";
-          this.rpc?.close("datachannel closed");
-          this.rpc = null;
-          this.stopKeepalive();
-          this.claim?.release();
-          this.claim = null;
+          void this.teardown("datachannel closed");
         }
       };
     } catch (err) {

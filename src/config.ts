@@ -13,11 +13,10 @@ export interface DeviceConfig {
   password?: string;
   passwordEnv?: string;
   passwordFile?: string;
-  noTlsVerify?: boolean;
 }
 
 export interface ScreenshotConfig {
-  engine: "auto" | "browser" | "recorder" | "wasm";
+  engine: "auto" | "browser" | "recorder";
   recorderPath: string;
   chromiumPath: string;
   screenshotDir: string;
