@@ -1,0 +1,9 @@
+DESIGN.md
+PLAN.md
+node_modules/
+bun.lock
+bun.lockb
+*.log
+screenshots/
+test/fixtures/*.h264
+.omp/

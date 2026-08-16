@@ -1,0 +1,5 @@
+# omp (a Bun process started in this directory) preloads the transient-socket
+# filter: omp's postmortem otherwise kills the session (exit 2, "Operation
+# aborted") on harmless stackless ECONNREFUSED recv errors from native IO
+# pools. See README "Known issues".
+preload = ["./scripts/filter-transient-socket.ts"]

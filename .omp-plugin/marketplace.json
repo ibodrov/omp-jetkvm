@@ -1,0 +1,14 @@
+{
+  "name": "omp-jetkvm",
+  "plugins": [
+    {
+      "name": "jetkvm",
+      "version": "0.1.0",
+      "description": "Drive a remote JetKVM device from omp agents: screenshots, mouse, keyboard, virtual media (ISO mount/upload), ATX power.",
+      "license": "Apache-2.0",
+      "category": "development",
+      "source": "./",
+      "keywords": ["jetkvm", "kvm", "hardware", "remote-control", "webrtc"]
+    }
+  ]
+}

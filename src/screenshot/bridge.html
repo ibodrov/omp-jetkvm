@@ -1,0 +1,105 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>jetkvm bridge</title>
+</head>
+<body>
+<!-- Self-contained decode bridge: the extension process owns ALL device HTTP
+     (login, signaling POST); this page only renders the negotiated stream and
+     returns pixels. No credentials ever live here beyond single-use SDP. -->
+<video id="v" muted playsinline autoplay></video>
+<script>
+(() => {
+  const video = document.getElementById("v");
+  let pc = null;
+  let frameReady = false;
+  let lastFrameAt = 0;
+
+  function onFrame() {
+    frameReady = true;
+    lastFrameAt = performance.now();
+    // keep watching so captures always see a recent frame
+    video.requestVideoFrameCallback(onFrame);
+  }
+
+  window.__jetkvm = {
+    async createOffer() {
+      if (pc) { try { pc.close(); } catch (e) {} pc = null; frameReady = false; }
+      pc = new RTCPeerConnection();
+      pc.addTransceiver("video", { direction: "recvonly" });
+      pc.ontrack = (ev) => {
+        video.srcObject = ev.streams[0];
+        video.play().catch(() => {});
+        video.requestVideoFrameCallback(onFrame);
+      };
+      const offer = await pc.createOffer();
+      // The device switches to candidate-trickle (over a WebSocket we never
+      // open) when the offer advertises trickle support — Chrome always does.
+      // Strip it so the answer arrives candidate-complete (non-trickle), the
+      // same exchange werift's control session uses.
+      offer.sdp = offer.sdp.replace(/a=ice-options:trickle\r?\n/g, "");
+      await pc.setLocalDescription(offer);
+      await new Promise((resolve) => {
+        if (pc.iceGatheringState === "complete") return resolve();
+        const done = () => { if (pc && pc.iceGatheringState === "complete") resolve(); };
+        pc.addEventListener("icegatheringstatechange", done);
+        setTimeout(resolve, 3000); // host candidates on a LAN arrive fast
+      });
+      return btoa(JSON.stringify({ type: "offer", sdp: pc.localDescription.sdp }));
+    },
+    async setAnswer(b64) {
+      if (!pc) throw new Error("no offer created");
+      const desc = JSON.parse(atob(b64));
+      await pc.setRemoteDescription(desc);
+    },
+    async waitFrame(timeoutMs = 15000) {
+      const t0 = Date.now();
+      while (!frameReady) {
+        if (Date.now() - t0 > timeoutMs) {
+          throw new Error("no video frame within " + timeoutMs + "ms — host may be off / no signal");
+        }
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      return true;
+    },
+    async capture(opts) {
+      if (!frameReady) throw new Error("not connected");
+      const format = opts.format === "png" ? "image/png" : "image/jpeg";
+      const w = video.videoWidth, h = video.videoHeight;
+      if (!w || !h) throw new Error("video has no dimensions");
+      const fullCanvas = document.createElement("canvas");
+      fullCanvas.width = w; fullCanvas.height = h;
+      fullCanvas.getContext("2d").drawImage(video, 0, 0);
+      const fullB64 = fullCanvas.toDataURL(format, Math.max(0.85, (opts.quality ?? 75) / 100)).split(",")[1];
+
+      const modelWidth = Math.min(opts.maxModelWidth ?? 1024, w);
+      const scale = modelWidth / w;
+      const modelCanvas = document.createElement("canvas");
+      modelCanvas.width = Math.round(w * scale);
+      modelCanvas.height = Math.round(h * scale);
+      modelCanvas.getContext("2d").drawImage(video, 0, 0, modelCanvas.width, modelCanvas.height);
+      const modelB64 = modelCanvas.toDataURL(format, (opts.quality ?? 75) / 100).split(",")[1];
+      return { fullB64, modelB64, width: w, height: h, ageMs: Math.round(performance.now() - lastFrameAt) };
+    },
+    state() {
+      return {
+        connected: pc ? pc.connectionState : null,
+        frameReady,
+        ageMs: frameReady ? Math.round(performance.now() - lastFrameAt) : null,
+        width: video.videoWidth,
+        height: video.videoHeight,
+      };
+    },
+    close() {
+      if (pc) { try { pc.close(); } catch (e) {} }
+      pc = null;
+      frameReady = false;
+      lastFrameAt = 0;
+      video.srcObject = null;
+    },
+  };
+})();
+</script>
+</body>
+</html>

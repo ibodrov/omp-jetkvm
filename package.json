@@ -1,0 +1,25 @@
+{
+  "name": "omp-jetkvm",
+  "version": "0.1.0",
+  "description": "oh-my-pi extension: drive a remote JetKVM device (screen, mouse, keyboard, virtual media) from agents",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./src/index.ts",
+  "omp": {
+    "extensions": ["./src/index.ts"]
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "smoke": "bun scripts/smoke.ts"
+  },
+  "dependencies": {
+    "puppeteer-core": "^24.0.0",
+    "werift": "0.24.4",
+    "yaml": "^2.8.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.0",
+    "typescript": "^5.9.0"
+  }
+}

@@ -1,0 +1,18 @@
+omp-jetkvm
+Copyright 2026 Ivan Bodrov <ibodrov@gmail.com>
+
+This product is an independent interoperability implementation of the
+JetKVM local network API. It contains no source code from the JetKVM
+project (github.com/jetkvm/kvm, GPL-2.0). Protocol behavior documented
+here was derived from public protocol observation and the uncopyrightable
+functional facts of the device's wire protocol, and from the public
+USB-IF HID Usage Tables specification for keyboard usage IDs.
+
+Third-party components used at runtime:
+- werift (MIT) — WebRTC implementation
+- puppeteer-core (Apache-2.0) — headless Chromium control (browser engine)
+- yaml (ISC) — configuration parsing
+
+The optional `recorder` screenshot engine shells out to the external
+`recorder-for-jetkvm` binary if installed; that binary is not distributed
+with this package.
