@@ -1,0 +1,34 @@
+diff --git a/lib/common/src/transport.js b/lib/common/src/transport.js
+index 4f11da0c6df6a8c6e8cb44cf6e1a1c2090c1e60e..b40af44ae1ebd7cd48668a47667644f33ebc2b73 100644
+--- a/lib/common/src/transport.js
++++ b/lib/common/src/transport.js
+@@ -159,6 +159,12 @@ class UdpTransport {
+             this.socket.bind({ address });
+         }
+         await new Promise((r) => this.socket.once("listening", r));
++        // A remote reboot can surface an asynchronous ICMP rejection as a
++        // dgram "error" event. With no listener, EventEmitter turns that
++        // connection failure into an uncaught process-level exception.
++        this.socket.on("error", (error) => {
++            log("udp socket error", error);
++        });
+     }
+     get address() {
+         return this.socket.address();
+diff --git a/lib/index.mjs b/lib/index.mjs
+index bd453cff7e694f564dff562025b3f6047d86ee50..fba26c5e7ec4fee381a3600e745f6659d86ff697 100644
+--- a/lib/index.mjs
++++ b/lib/index.mjs
+@@ -679,6 +679,12 @@ var UdpTransport = class _UdpTransport {
+       this.socket.bind({ address });
+     }
+     await new Promise((r) => this.socket.once("listening", r));
++    // A remote reboot can surface an asynchronous ICMP rejection as a
++    // dgram "error" event. With no listener, EventEmitter turns that
++    // connection failure into an uncaught process-level exception.
++    this.socket.on("error", (error) => {
++      log("udp socket error", error);
++    });
+   }
+   send = async (data, addr) => {
+     if (addr && !net.isIP(addr[0])) {

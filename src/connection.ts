@@ -125,9 +125,9 @@ export class AuthState {
     }
     const doFetch = async (cookie: string | null): Promise<Response> => {
       const headers = new Headers(init.headers);
-      // The device aggressively resets pooled connections (observed as
-      // stackless ECONNREFUSED escaping Bun's keep-alive pool inside the omp
-      // process and killing the session). One-shot sockets only.
+      // The device aggressively resets pooled HTTP connections. One-shot
+      // sockets avoid reusing a stale keep-alive connection; request failures
+      // still reject through fetch and remain local to the calling tool.
       headers.set("Connection", "close");
       if (cookie) headers.set("Cookie", cookie);
       try {

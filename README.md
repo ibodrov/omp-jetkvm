@@ -84,17 +84,21 @@ leaves the old server running.
 - The device answers without ICE candidates and dials the offerer's candidates; Chromium's mDNS candidates are unusable (see engine flag above).
 - ATX/DC state sensing reads unwired hardware as "off" even while the host runs; power-control RPCs succeed but drive nothing on hosts without the harness wired (this deployment).
 
-## Known issues in this environment
+## Runtime resilience and known issues
 
-- omp sessions that mix `jetkvm_screenshot` with input tools occasionally die
-  (interactive: exit 2 + "Operation aborted"; print: exit 1 + "[Uncaught
-  Exception]") on a stackless `ECONNREFUSED: connection refused, recv` — a
-  transient native-socket error from host-process IO pools, which omp's
-  postmortem treats as fatal. The tool calls themselves succeed; `omp --resume`
-  continues cleanly. Mitigation shipped: this repo's `bunfig.toml` preloads
-  `scripts/filter-transient-socket.ts`, which swallows exactly that error
-  shape (no stack) before omp's fatal handler — it applies to any omp run
-  started from this directory. Fixing the overreaction belongs upstream.
+- `werift@0.24.4` creates ICE `node:dgram` sockets without an `error`
+  listener. When a JetKVM reboots, Linux/Bun can deliver the resulting ICMP
+  port rejection as a stackless `ECONNREFUSED: connection refused, recv`;
+  EventEmitter otherwise promotes it to an uncaught exception and omp exits.
+  `patchedDependencies` applies `patches/werift@0.24.4.patch` to both werift
+  entry builds. The socket error is now contained; the existing RPC keepalive
+  tears down the dead session and a later idempotent call can reconnect.
+  `test/connection-resilience.test.ts` reproduces the remote-port loss in a
+  child process.
+- This repo's `bunfig.toml` still preloads
+  `scripts/filter-transient-socket.ts` as defense in depth for identical
+  stackless errors from non-werift Bun sockets. It only affects omp started
+  from this directory; the installed extension's fix does not depend on it.
 - The browser engine rebuilds its video session when the last decoded frame
   is older than 5 s (the device encoder only emits on screen change and can
   stall long-lived sessions; fresh sessions get an immediate IDR).

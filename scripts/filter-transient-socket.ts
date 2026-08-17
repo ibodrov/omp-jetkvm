@@ -1,11 +1,10 @@
 /**
- * omp dies (exit 2, "Operation aborted") on transient stackless socket errors
- * from Bun-native IO pools ("ECONNREFUSED: connection refused, recv"). They
- * are harmless — sessions complete when not treated as fatal. This preload
- * wraps omp's uncaughtException handler so exactly that error shape (no
- * stack) is swallowed; everything else passes through untouched.
- * Install via `preload = [...]` in the bunfig.toml of the directory you run
- * omp from.
+ * Defense-in-depth fallback for stackless socket errors outside werift's
+ * patched ICE UDP transport. omp treats every uncaught exception as fatal;
+ * this preload wraps its handler and swallows only the known Bun error shape.
+ *
+ * It is loaded by this repo's bunfig.toml and is not required by installed
+ * copies of the extension.
  */
 type Handler = (...args: unknown[]) => void;
 type LooseOn = (ev: string, fn: Handler, ...rest: unknown[]) => unknown;

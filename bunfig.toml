@@ -1,5 +1,5 @@
-# omp (a Bun process started in this directory) preloads the transient-socket
-# filter: omp's postmortem otherwise kills the session (exit 2, "Operation
-# aborted") on harmless stackless ECONNREFUSED recv errors from native IO
-# pools. See README "Known issues".
+# Defense in depth for omp started from this directory. The werift dependency
+# patch contains ICE UDP failures in every installed extension; this preload
+# catches the identical stackless error if another Bun-native socket emits it
+# before omp's fatal uncaught-exception handler.
 preload = ["./scripts/filter-transient-socket.ts"]
