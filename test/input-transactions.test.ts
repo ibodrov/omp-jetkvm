@@ -179,8 +179,40 @@ describe("ambiguous input failures", () => {
     expect(reports.map((report) => report["modifier"])).toEqual([1, 0]);
     expect(locks.input.holderInfo.held).toBe(false);
   });
-});
+  test("a failed keyboard cleanup still attempts mouse cleanup", async () => {
+    const mouseReports: Record<string, unknown>[] = [];
+    const locks = createDeviceLocks(1_000);
+    let failKeyboardCleanup = true;
+    const session = {
+      auth: { tokenRotatedRecently: () => false },
+      locks,
+      lastMouse: null,
+      async ensureConnected() {},
+      ensureClaim() {},
+      async call(method: string, params: Record<string, unknown> = {}) {
+        if (method === "getKeyDownState") return { modifier: 0, keys: [0, 0, 0, 0, 0, 0] };
+        if (method === "keyboardReport" && params["modifier"] === 0 && failKeyboardCleanup) {
+          failKeyboardCleanup = false;
+          throw new Error("keyboard cleanup response lost");
+        }
+        if (method === "absMouseReport") mouseReports.push(params);
+        return null;
+      },
+    } as unknown as DeviceSession;
 
+    await expect(
+      runInputTransaction(session, "cleanup-test", async (tx) => {
+        await tx.keyboardReport(1, []);
+        await tx.mouseReport(10, 20, 1);
+        throw new Error("operation failed");
+      }),
+    ).rejects.toThrow(/operation failed/);
+    expect(mouseReports).toContainEqual({ x: 10, y: 20, buttons: 1 });
+    expect(mouseReports).toContainEqual({ x: 10, y: 20, buttons: 0 });
+    expect(locks.input.holderInfo.held).toBe(false);
+  });
+
+});
 describe("teardown drains parked holds", () => {
   test("dispose releases a parked manual hold's mutex", async () => {
     // Real DeviceSession: dispose() runs the production teardown path.

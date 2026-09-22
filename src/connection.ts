@@ -29,6 +29,7 @@ export type ConnectionState = "idle" | "connecting" | "connected";
 
 export interface VideoState {
   ready?: boolean;
+  error?: string;
   streaming?: number;
   width?: number;
   height?: number;
@@ -153,6 +154,93 @@ export class AuthState {
     this.lastRotationAt = Date.now();
     return doFetch(this.cookie);
   }
+  /**
+   * Exchange an SDP offer over the firmware 0.5.9 signaling WebSocket.
+   * Metadata frames are informational; remote ICE candidates are forwarded to
+   * the caller while the socket remains open until explicitly closed.
+   */
+  async websocketSignaling(
+    offerB64: string,
+    onCandidate?: (candidate: unknown) => void | Promise<void>,
+    signal?: AbortSignal,
+  ): Promise<{ answer: string; close: () => void }> {
+    if (signal?.aborted) throw new JetKvmError("Aborted", "signaling connection aborted");
+    // A removed REST signaling route returns 404 even for expired cookies.
+    // Probe a protected endpoint so the normal 401 recovery runs before WS.
+    const authCheck = await this.authedFetch("/device", { signal });
+    if (!authCheck.ok) {
+      throw new JetKvmError("AuthError", `signaling authentication failed: HTTP ${authCheck.status}`);
+    }
+    const wsOrigin = this.origin.replace(/^http:/, "ws:").replace(/^https:/, "wss:");
+    const ws = new WebSocket(`${wsOrigin}/webrtc/signaling/client`, {
+      headers: this.cookie ? { Cookie: this.cookie } : undefined,
+    });
+    return new Promise<{ answer: string; close: () => void }>((resolve, reject) => {
+      let answered = false;
+      let closed = false;
+      let answerValue = "";
+      const cleanup = (): void => {
+        if (closed) return;
+        closed = true;
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+        try {
+          ws.close();
+        } catch {
+          // already closed
+        }
+      };
+      const fail = (err: Error): void => {
+        if (answered) {
+          cleanup();
+          return;
+        }
+        cleanup();
+        reject(err);
+      };
+      const onAbort = (): void => fail(new JetKvmError("Aborted", "signaling connection aborted"));
+      const timer = setTimeout(
+        () => fail(new JetKvmError("SignalingTimeout", "no signaling answer within 10s")),
+        10_000,
+      );
+      ws.onerror = () => fail(new JetKvmError("SignalingFailed", "signaling WebSocket failed"));
+      ws.onclose = () => {
+        if (!answered) fail(new JetKvmError("SignalingFailed", "signaling WebSocket closed before answer"));
+      };
+      ws.onmessage = (event) => {
+        let msg: unknown;
+        try {
+          msg = JSON.parse(String(event.data));
+        } catch {
+          return;
+        }
+        if (typeof msg !== "object" || msg === null) return;
+        const frame = msg as { type?: unknown; data?: unknown };
+        if (frame.type === "answer" && typeof frame.data === "string" && !answered) {
+          answered = true;
+          clearTimeout(timer);
+          answerValue = frame.data;
+          resolve({ answer: answerValue, close: cleanup });
+        } else if (frame.type === "new-ice-candidate" && onCandidate) {
+          void Promise.resolve(onCandidate(frame.data)).catch((err) => fail(err instanceof Error ? err : new Error(String(err))));
+        } else if (frame.type === "error") {
+          fail(new JetKvmError("SignalingFailed", `signaling WebSocket error: ${String(frame.data ?? "unknown error")}`));
+        }
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (signal?.aborted) {
+        onAbort();
+        return;
+      }
+      ws.onopen = () => {
+        try {
+          ws.send(JSON.stringify({ type: "offer", data: { sd: offerB64 } }));
+        } catch (err) {
+          fail(new JetKvmError("SignalingFailed", `failed to send signaling offer: ${String(err)}`));
+        }
+      };
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -197,11 +285,15 @@ export class DeviceSession {
   readonly locks: DeviceLocks;
   private pc: RTCPeerConnection | null = null;
   private dc: RTCDataChannel | null = null;
+  private connectingPc: RTCPeerConnection | null = null;
+  private connectingDc: RTCDataChannel | null = null;
   private rpc: JsonRpcClient | null = null;
   private connectPromise: Promise<void> | null = null;
   private keepaliveTimer: Timer | null = null;
   private claim: CrossProcessClaim | null = null;
   private backoffAttempt = 0;
+  /** Invalidates a connect that is superseded by teardown/reconnect. */
+  private connectionGeneration = 0;
 
   state: ConnectionState = "idle";
   lastActivity = 0;
@@ -276,7 +368,8 @@ export class DeviceSession {
     this.lastActivity = Date.now();
     switch (event.method) {
       case "videoInputState":
-        this.videoState = { ...this.videoState, ...(event.params as VideoState) };
+        // Firmware sends complete snapshots; omitted fields clear old errors.
+        this.videoState = event.params as VideoState;
         break;
       case "atxState":
         this.atxState = event.params as { power?: boolean; hdd?: boolean };
@@ -290,7 +383,10 @@ export class DeviceSession {
   }
 
   private async teardown(reason: string): Promise<void> {
+    this.connectionGeneration++;
     this.state = "idle";
+    this.connectedAt = 0;
+    this.lastActivity = 0;
     this.rpc?.close(reason);
     this.rpc = null;
     // A dropped channel must not leave the input mutex locked by a parked
@@ -308,6 +404,21 @@ export class DeviceSession {
       // already closed
     }
     this.pc = null;
+    try {
+      this.connectingDc?.close();
+    } catch {
+      // already closed
+    }
+    this.connectingDc = null;
+    try {
+      this.connectingPc?.close();
+    } catch {
+      // already closed
+    }
+    this.connectingPc = null;
+    // A fresh connection must repopulate dimensions instead of serving
+    // coordinates from the previous stream after a reboot/resolution change.
+    this.videoState = {};
     this.stopKeepalive();
     this.claim?.release();
     this.claim = null;
@@ -339,13 +450,19 @@ export class DeviceSession {
   }
 
   private async connect(): Promise<void> {
+    const generation = this.connectionGeneration;
     // Capped exponential backoff between *automatic* reconnect attempts.
     if (this.backoffAttempt > 0) {
       await sleep(clamp(500 * 2 ** (this.backoffAttempt - 1), 500, 30_000));
     }
+    if (generation !== this.connectionGeneration) {
+      throw new JetKvmError("ConnectionLost", "connection attempt superseded");
+    }
     this.state = "connecting";
     const pc = new RTCPeerConnection({ iceServers: [] });
     const dc = pc.createDataChannel("rpc");
+    this.connectingPc = pc;
+    this.connectingDc = dc;
     const opened = new Promise<void>((resolve, reject) => {
       const t = setTimeout(
         () => reject(new JetKvmError("ConnectionTimeout", "rpc datachannel did not open in 10s")),
@@ -369,8 +486,21 @@ export class DeviceSession {
       this.lastActivity = Date.now();
       rpc.handleMessage(data);
     });
-    const unsubscribe = rpc.onEvent((e) => this.handleEvent(e));
-
+    const unsubscribe = rpc.onEvent((event) => this.handleEvent(event));
+    let signaling: { close: () => void } | null = null;
+    let remoteDescriptionSet = false;
+    const pendingCandidates: unknown[] = [];
+    const onCandidate = async (candidate: unknown): Promise<void> => {
+      const value = candidate as { candidate?: string; sdpMid?: string | null; sdpMLineIndex?: number | null };
+      if (remoteDescriptionSet) await pc.addIceCandidate(value);
+      else pendingCandidates.push(value);
+    };
+    const addPendingCandidates = async (): Promise<void> => {
+      remoteDescriptionSet = true;
+      for (const candidate of pendingCandidates.splice(0)) {
+        await pc.addIceCandidate(candidate as { candidate?: string; sdpMid?: string | null; sdpMLineIndex?: number | null });
+      }
+    };
     try {
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
@@ -384,17 +514,34 @@ export class DeviceSession {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ sd: sdpCodec.encode(local as { type: string; sdp: string }) }),
       });
-      if (!resp.ok) {
-        throw new JetKvmError("SignalingFailed", `POST /webrtc/session -> HTTP ${resp.status}`);
+      let answerB64: string;
+      if (resp.status === 404) {
+        const exchange = await this.auth.websocketSignaling(sdpCodec.encode(local as { type: string; sdp: string }), onCandidate);
+        signaling = exchange;
+        answerB64 = exchange.answer;
+      } else {
+        if (!resp.ok) {
+          throw new JetKvmError("SignalingFailed", `POST /webrtc/session -> HTTP ${resp.status}`);
+        }
+        const body = (await resp.json()) as { sd: string };
+        answerB64 = body.sd;
       }
-      const { sd } = (await resp.json()) as { sd: string };
-      const answer = sdpCodec.decode(sd);
+      const answer = sdpCodec.decode(answerB64);
       await pc.setRemoteDescription({ type: "answer", sdp: answer.sdp });
+      await addPendingCandidates();
       await opened;
       await rpc.call("ping", {}, { timeoutMs: 5_000 });
-
+      signaling?.close();
+      signaling = null;
+      // A user-ordered reconnect/dispose may have torn down this in-flight
+      // peer while signaling or pinging. Never publish that stale channel.
+      if (generation !== this.connectionGeneration) {
+        throw new JetKvmError("ConnectionLost", "connection attempt superseded");
+      }
       this.pc = pc;
       this.dc = dc;
+      this.connectingPc = null;
+      this.connectingDc = null;
       this.rpc = rpc;
       this.state = "connected";
       this.connectedAt = Date.now();
@@ -406,7 +553,7 @@ export class DeviceSession {
       // Prime the video coordinate space; events keep it fresh afterwards.
       try {
         const vs = (await rpc.call("getVideoState")) as VideoState;
-        this.videoState = { ...this.videoState, ...vs };
+        this.videoState = vs;
       } catch {
         // device may lack it; videoInputState events still update us
       }
@@ -419,7 +566,11 @@ export class DeviceSession {
         }
       };
     } catch (err) {
+      signaling?.close();
+      signaling = null;
       unsubscribe();
+      if (this.connectingPc === pc) this.connectingPc = null;
+      if (this.connectingDc === dc) this.connectingDc = null;
       try {
         dc.close();
       } catch {
@@ -465,7 +616,7 @@ export class DeviceSession {
       return { width: this.videoState.width, height: this.videoState.height };
     }
     const vs = (await this.call("getVideoState", {}, { retryOnReconnect: true, signal })) as VideoState;
-    this.videoState = { ...this.videoState, ...vs };
+    this.videoState = vs;
     if (!vs.width || !vs.height) {
       throw new JetKvmError(
         "NoVideoSignal",
@@ -477,12 +628,17 @@ export class DeviceSession {
 
   /** Force a rebuild (used by `/jetkvm reconnect`). */
   async reconnect(): Promise<void> {
+    const pending = this.connectPromise;
     await this.teardown("user-ordered reconnect");
+    if (pending) await pending.catch(() => {});
+    this.backoffAttempt = 0;
     await this.ensureConnected();
   }
 
   async dispose(): Promise<void> {
+    const pending = this.connectPromise;
     await this.teardown("disposed");
+    if (pending) await pending.catch(() => {});
   }
 
   snapshot(): Record<string, unknown> {

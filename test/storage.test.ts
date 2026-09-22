@@ -4,7 +4,7 @@
  * refusal must leave the old server alive.
  */
 import { beforeEach, describe, expect, test } from "bun:test";
-import { retireServeServer, serveAndMount, stopServeServer, unmount } from "../src/storage.ts";
+import { mountUrl, retireServeServer, serveAndMount, stopServeServer, unmount } from "../src/storage.ts";
 import type { DeviceSession } from "../src/connection.ts";
 import type { PolicyConfig } from "../src/config.ts";
 import { rmSync, writeFileSync } from "node:fs";
@@ -117,6 +117,17 @@ describe("retireServeServer", () => {
     await retireServeServer(session, POLICY);
     expect(calls).toEqual([]);
   });
+});
+
+test("mount URL preflight transport failures are not treated as advisory", async () => {
+  const session = {
+    auth: { hostname: HOSTNAME },
+    async call(method: string) {
+      if (method === "checkMountUrl") throw new Error("device unreachable");
+      throw new Error(`unexpected RPC ${method}`);
+    },
+  } as unknown as DeviceSession;
+  await expect(mountUrl(session, POLICY, { url: "http://127.0.0.1/iso" })).rejects.toThrow(/device unreachable/);
 });
 
 describe("unmount server safety", () => {

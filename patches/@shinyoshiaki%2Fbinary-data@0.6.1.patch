@@ -1,0 +1,268 @@
+diff --git a/node_modules/@shinyoshiaki/binary-data/.bun-tag-4cba8e2619904acc b/.bun-tag-4cba8e2619904acc
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
+diff --git a/src/index.js b/src/index.js
+index f566e528acf5b842e4af28c616690406bbd2086f..a82a88a957c8982d0f50872e0ca57a4a3959c088 100644
+--- a/src/index.js
++++ b/src/index.js
+@@ -1,19 +1,19 @@
+ 'use strict';
+ 
+-const BinaryStream = require('lib/binary-stream');
+-const array = require('types/array');
+-const buffer = require('types/buffer');
+-const bool = require('types/bool');
+-const reserved = require('types/reserved');
+-const string = require('types/string');
+-const numbers = require('types/numbers');
+-const when = require('types/when');
+-const select = require('types/select');
+-const { encode } = require('lib/encode');
+-const { decode } = require('lib/decode');
+-const { encodingLength } = require('lib/encoding-length');
+-const Transaction = require('lib/transaction');
+-const NotEnoughDataError = require('lib/not-enough-data-error');
++const BinaryStream = require('./node_modules/lib/binary-stream.js');
++const array = require('./node_modules/types/array.js');
++const buffer = require('./node_modules/types/buffer.js');
++const bool = require('./node_modules/types/bool.js');
++const reserved = require('./node_modules/types/reserved.js');
++const string = require('./node_modules/types/string.js');
++const numbers = require('./node_modules/types/numbers.js');
++const when = require('./node_modules/types/when.js');
++const select = require('./node_modules/types/select.js');
++const { encode } = require('./node_modules/lib/encode.js');
++const { decode } = require('./node_modules/lib/decode.js');
++const { encodingLength } = require('./node_modules/lib/encoding-length.js');
++const Transaction = require('./node_modules/lib/transaction.js');
++const NotEnoughDataError = require('./node_modules/lib/not-enough-data-error.js');
+ 
+ const types = {
+   array,
+diff --git a/src/node_modules/internal/buffer-list.js b/src/node_modules/internal/buffer-list.js
+index 729b40e51b7c50f77a4c0b9aabd0a2dae530b1d6..18b75f784d8088fa21a58d480a4f7fdcb72e8975 100644
+--- a/src/node_modules/internal/buffer-list.js
++++ b/src/node_modules/internal/buffer-list.js
+@@ -1,7 +1,7 @@
+ 'use strict';
+ 
+ const createFunction = require('generate-function');
+-const LinkedList = require('internal/linked-list');
++const LinkedList = require('./linked-list.js');
+ 
+ /**
+  * An optimised partial implementation of Buffer list from `bl`.
+diff --git a/src/node_modules/internal/meta.js b/src/node_modules/internal/meta.js
+index cda51163f34914d75b243b7104f6388cc37be761..de3c4c19c4c4bc6838c153bbe01bc5fdf0e5dabb 100644
+--- a/src/node_modules/internal/meta.js
++++ b/src/node_modules/internal/meta.js
+@@ -1,6 +1,6 @@
+ 'use strict';
+ 
+-const symbols = require('internal/symbols');
++const symbols = require('./symbols.js');
+ 
+ /**
+  * Store extended info between encode/decode calls.
+diff --git a/src/node_modules/lib/binary-stream.js b/src/node_modules/lib/binary-stream.js
+index 77b8015d405963ed91947f7661387d141b29ad5c..6bbd1e1b632edb0ac5096b63f8079655ffc0e282 100644
+--- a/src/node_modules/lib/binary-stream.js
++++ b/src/node_modules/lib/binary-stream.js
+@@ -2,8 +2,8 @@
+ 
+ const { Transform } = require('stream');
+ const createFunction = require('generate-function');
+-const BufferList = require('internal/buffer-list');
+-const NotEnoughDataError = require('lib/not-enough-data-error');
++const BufferList = require('./../internal/buffer-list.js');
++const NotEnoughDataError = require('./not-enough-data-error.js');
+ 
+ const kbuffer = Symbol('buffer');
+ 
+diff --git a/src/node_modules/lib/decode.js b/src/node_modules/lib/decode.js
+index 403c7bfbf228c1b1083ffe994d17850a148a2c24..95779bd0208cf6c8d909ee28188ae3c6c099ac52 100644
+--- a/src/node_modules/lib/decode.js
++++ b/src/node_modules/lib/decode.js
+@@ -1,9 +1,9 @@
+ 'use strict';
+ 
+-const { isType, isUserType, isDecodeType } = require('lib/util');
+-const BinaryStream = require('lib/binary-stream');
+-const symbols = require('internal/symbols');
+-const Metadata = require('internal/meta');
++const { isType, isUserType, isDecodeType } = require('./util.js');
++const BinaryStream = require('./binary-stream.js');
++const symbols = require('./../internal/symbols.js');
++const Metadata = require('./../internal/meta.js');
+ 
+ module.exports = {
+   decode,
+diff --git a/src/node_modules/lib/encode.js b/src/node_modules/lib/encode.js
+index 723d7d19b77e1fa195638b857af424120b2fe75c..6f25bfc9be3491fca5a109c845d32cc3592a7af2 100644
+--- a/src/node_modules/lib/encode.js
++++ b/src/node_modules/lib/encode.js
+@@ -1,9 +1,9 @@
+ 'use strict';
+ 
+-const { isUserType, isEncodeType, isType } = require('lib/util');
+-const symbols = require('internal/symbols');
+-const Metadata = require('internal/meta');
+-const BinaryStream = require('lib/binary-stream');
++const { isUserType, isEncodeType, isType } = require('./util.js');
++const symbols = require('./../internal/symbols.js');
++const Metadata = require('./../internal/meta.js');
++const BinaryStream = require('./binary-stream.js');
+ 
+ module.exports = {
+   encode,
+diff --git a/src/node_modules/lib/encoding-length.js b/src/node_modules/lib/encoding-length.js
+index 93725af0c171f8f0952031d2ec4c5914d0a76ce2..aec4871b37266edc1eb14baf472e004cd2ccff31 100644
+--- a/src/node_modules/lib/encoding-length.js
++++ b/src/node_modules/lib/encoding-length.js
+@@ -1,8 +1,8 @@
+ 'use strict';
+ 
+-const { isUserType, isType } = require('lib/util');
+-const Metadata = require('internal/meta');
+-const symbols = require('internal/symbols');
++const { isUserType, isType } = require('./util.js');
++const Metadata = require('./../internal/meta.js');
++const symbols = require('./../internal/symbols.js');
+ 
+ module.exports = {
+   encodingLength,
+diff --git a/src/node_modules/lib/transaction.js b/src/node_modules/lib/transaction.js
+index 97fae03db66f1efb3feb7d8db954e9f936ce79c0..86d69f95554450cfacc7beb982fc26604a503927 100644
+--- a/src/node_modules/lib/transaction.js
++++ b/src/node_modules/lib/transaction.js
+@@ -1,7 +1,7 @@
+ 'use strict';
+ 
+ const createFunction = require('generate-function');
+-const NotEnoughDataError = require('lib/not-enough-data-error');
++const NotEnoughDataError = require('./not-enough-data-error.js');
+ 
+ /**
+  * Helps to read the whole data chunk.
+diff --git a/src/node_modules/types/array.js b/src/node_modules/types/array.js
+index 9f1aecafe27ce37f4b733cb46e9669f5e3e78342..4d9b8ef32fee0ccf701f47cc28f37ad5fca133eb 100644
+--- a/src/node_modules/types/array.js
++++ b/src/node_modules/types/array.js
+@@ -1,10 +1,10 @@
+ 'use strict';
+ 
+-const { decodeCommon } = require('lib/decode');
+-const { encodeCommon } = require('lib/encode');
+-const { encodingLengthCommon } = require('lib/encoding-length');
+-const { isType, isUserType, isFunction } = require('lib/util');
+-const Metadata = require('internal/meta');
++const { decodeCommon } = require('./../lib/decode.js');
++const { encodeCommon } = require('./../lib/encode.js');
++const { encodingLengthCommon } = require('./../lib/encoding-length.js');
++const { isType, isUserType, isFunction } = require('./../lib/util.js');
++const Metadata = require('./../internal/meta.js');
+ 
+ module.exports = array;
+ 
+diff --git a/src/node_modules/types/bool.js b/src/node_modules/types/bool.js
+index 88d16d3d4543ff88d057a33d9c5535ccfee032d8..dfd5cc218bd47e6ac6f91f1d49b3bb84e4764cd7 100644
+--- a/src/node_modules/types/bool.js
++++ b/src/node_modules/types/bool.js
+@@ -1,6 +1,6 @@
+ 'use strict';
+ 
+-const { isType } = require('lib/util');
++const { isType } = require('./../lib/util.js');
+ 
+ module.exports = bool;
+ 
+diff --git a/src/node_modules/types/buffer.js b/src/node_modules/types/buffer.js
+index 582cb6adbcfc7f83e661bb68347a4cf4d43c9e3f..dc600cd1d8aa26ceacd784ac5309a3133289e776 100644
+--- a/src/node_modules/types/buffer.js
++++ b/src/node_modules/types/buffer.js
+@@ -1,8 +1,8 @@
+ 'use strict';
+ 
+-const { isType, isFunction } = require('lib/util');
+-const NotEnoughDataError = require('lib/not-enough-data-error');
+-const BinaryStream = require('lib/binary-stream');
++const { isType, isFunction } = require('./../lib/util.js');
++const NotEnoughDataError = require('./../lib/not-enough-data-error.js');
++const BinaryStream = require('./../lib/binary-stream.js');
+ 
+ module.exports = buffer;
+ 
+diff --git a/src/node_modules/types/reserved.js b/src/node_modules/types/reserved.js
+index e887a6fb7f80dd1f01e912d1cf9675610d072fa5..c5d1cfc6d35ce83673e1b6f07e41b5e92ffe00a6 100644
+--- a/src/node_modules/types/reserved.js
++++ b/src/node_modules/types/reserved.js
+@@ -1,11 +1,11 @@
+ 'use strict';
+ 
+-const { decodeCommon } = require('lib/decode');
+-const { encodeCommon } = require('lib/encode');
+-const { encodingLengthCommon } = require('lib/encoding-length');
+-const { isType, isFunction } = require('lib/util');
+-const symbols = require('internal/symbols');
+-const Metadata = require('internal/meta');
++const { decodeCommon } = require('./../lib/decode.js');
++const { encodeCommon } = require('./../lib/encode.js');
++const { encodingLengthCommon } = require('./../lib/encoding-length.js');
++const { isType, isFunction } = require('./../lib/util.js');
++const symbols = require('./../internal/symbols.js');
++const Metadata = require('./../internal/meta.js');
+ 
+ module.exports = reserved;
+ 
+diff --git a/src/node_modules/types/select.js b/src/node_modules/types/select.js
+index d4076472ebea4e52b1e3b92f695cb6b8a6d84f14..899c970454778b65bd908ab97740338b5525e5e9 100644
+--- a/src/node_modules/types/select.js
++++ b/src/node_modules/types/select.js
+@@ -1,8 +1,8 @@
+ 'use strict';
+ 
+-const symbols = require('internal/symbols');
+-const { decodeCommon } = require('lib/decode');
+-const Metadata = require('internal/meta');
++const symbols = require('./../internal/symbols.js');
++const { decodeCommon } = require('./../lib/decode.js');
++const Metadata = require('./../internal/meta.js');
+ 
+ module.exports = select;
+ 
+diff --git a/src/node_modules/types/string.js b/src/node_modules/types/string.js
+index d9e2191880e9462b102601b6fb28ade87e0c2cfe..8971d54923a7415f43dfd8649c787513ed5cc4d2 100644
+--- a/src/node_modules/types/string.js
++++ b/src/node_modules/types/string.js
+@@ -1,7 +1,7 @@
+ 'use strict';
+ 
+-const { isType } = require('lib/util');
+-const NotEnoughDataError = require('lib/not-enough-data-error');
++const { isType } = require('./../lib/util.js');
++const NotEnoughDataError = require('./../lib/not-enough-data-error.js');
+ 
+ module.exports = string;
+ 
+diff --git a/src/node_modules/types/when.js b/src/node_modules/types/when.js
+index ffcdaa55f912b55a85da03b13e01d41c494512b4..55d5cf4d0a79f3cf4e96cd8fc7ce014393ccbbd6 100644
+--- a/src/node_modules/types/when.js
++++ b/src/node_modules/types/when.js
+@@ -1,11 +1,11 @@
+ 'use strict';
+ 
+-const { isType, isFunction, isUserType } = require('lib/util');
+-const symbols = require('internal/symbols');
+-const { decodeCommon } = require('lib/decode');
+-const { encodeCommon } = require('lib/encode');
+-const { encodingLengthCommon } = require('lib/encoding-length');
+-const Metadata = require('internal/meta');
++const { isType, isFunction, isUserType } = require('./../lib/util.js');
++const symbols = require('./../internal/symbols.js');
++const { decodeCommon } = require('./../lib/decode.js');
++const { encodeCommon } = require('./../lib/encode.js');
++const { encodingLengthCommon } = require('./../lib/encoding-length.js');
++const Metadata = require('./../internal/meta.js');
+ 
+ module.exports = when;
+ 

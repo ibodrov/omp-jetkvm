@@ -20,6 +20,7 @@ declare global {
     __jetkvm: {
       createOffer(): Promise<string>;
       setAnswer(b64: string): Promise<void>;
+      addCandidate(candidate: unknown): Promise<void>;
       waitFrame(ms: number): Promise<boolean>;
       capture(o: { format: string; quality: number; maxModelWidth: number }): Promise<{
         fullB64: string;
@@ -40,6 +41,7 @@ interface BridgeResult {
   modelB64: string;
   width: number;
   height: number;
+  ageMs?: number;
 }
 
 export class BrowserEngine implements ScreenshotEngine {
@@ -174,80 +176,94 @@ export class BrowserEngine implements ScreenshotEngine {
 
   /**
    * Full connection dance: page builds a recvonly offer (libwebrtc), the
-   * extension exchanges it over the device's HTTP signaling, the page sets
-   * the answer and waits for the first decoded frame.
+   * extension exchanges it over the device's HTTP or signaling WebSocket,
+   * then the page sets the answer and waits for the first decoded frame.
    */
   private async connectBridge(page: Page): Promise<void> {
     const offerB64 = (await page.evaluate("window.__jetkvm.createOffer()")) as string;
-    const resp = await this.auth.authedFetch("/webrtc/session", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sd: offerB64 }),
-    });
-    if (!resp.ok) {
-      throw new JetKvmError("SignalingFailed", `bridge signaling POST failed: HTTP ${resp.status}`);
+    let signaling: { close: () => void } | null = null;
+    try {
+      const resp = await this.auth.authedFetch("/webrtc/session", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sd: offerB64 }),
+      });
+      let answerB64: string;
+      if (resp.status === 404) {
+        const exchange = await this.auth.websocketSignaling(
+          offerB64,
+          (candidate) => page.evaluate((c: unknown) => window.__jetkvm.addCandidate(c), candidate),
+        );
+        signaling = exchange;
+        answerB64 = exchange.answer;
+      } else {
+        if (!resp.ok) {
+          throw new JetKvmError("SignalingFailed", `bridge signaling POST failed: HTTP ${resp.status}`);
+        }
+        const body = (await resp.json()) as { sd: string };
+        answerB64 = body.sd;
+      }
+      await page.evaluate((b64: string) => window.__jetkvm.setAnswer(b64), answerB64);
+      await page.evaluate((ms: number) => window.__jetkvm.waitFrame(ms), 15_000);
+    } finally {
+      signaling?.close();
     }
-    const { sd } = (await resp.json()) as { sd: string };
-    await page.evaluate((b64: string) => window.__jetkvm.setAnswer(b64), sd);
-    await page.evaluate((ms: number) => window.__jetkvm.waitFrame(ms), 15_000);
   }
 
-  private async ensureConnected(maxFrameAgeMs?: number, retryOnDeadPage = true): Promise<Page> {
+  private async ensureConnected(): Promise<Page> {
     const page = await this.ensurePage();
-    try {
-      const state = (await page.evaluate("window.__jetkvm.state()")) as {
-        connected?: string | boolean;
-        frameReady?: boolean;
-        ageMs?: number | null;
-      };
-      if (state.frameReady && (maxFrameAgeMs === undefined || (state.ageMs ?? Infinity) <= maxFrameAgeMs)) {
-        return page;
-      }
-      // No frame yet, or the decoded frame is stale (idle screen / stalled
-      // session): rebuild the session — fresh sessions get an immediate IDR.
-      if (state.frameReady) {
-        await page.evaluate("window.__jetkvm.close()");
-      }
-    } catch (err) {
-      // page died; relaunch once — a crash-looping page must not recurse forever
-      if (!retryOnDeadPage) throw err;
-      await this.closePage();
-      return this.ensureConnected(maxFrameAgeMs, false);
-    }
     if (!this.connecting) {
-      this.connecting = this.connectBridge(page)
-        .catch(async (err) => {
-          await this.closePage();
-          throw err;
-        })
-        .finally(() => {
-          this.connecting = null;
-        });
+      // JetKVM can stop updating an existing peer after another control
+      // session connects. Even a recently decoded frame may predate input.
+      // Keep Chromium warm, but reset the document/decoder and negotiate a
+      // fresh peer for each capture rather than returning cached pixels.
+      const pending = (async () => {
+        await page.reload({ waitUntil: "domcontentloaded" });
+        await this.connectBridge(page);
+      })().catch(async (err) => {
+        await this.closePage();
+        throw err;
+      });
+      this.connecting = pending;
+      pending.then(
+        () => { if (this.connecting === pending) this.connecting = null; },
+        () => { if (this.connecting === pending) this.connecting = null; },
+      );
     }
     await this.connecting;
     return page;
   }
 
+  private async capturePage(page: Page, opts: CaptureOptions): Promise<BridgeResult> {
+    const result = (await abortable(
+      page.evaluate(
+        (o: { format: string; quality: number; maxModelWidth: number }) =>
+          window.__jetkvm.capture(o),
+        { format: opts.format, quality: opts.quality, maxModelWidth: opts.maxModelWidth },
+      ),
+      opts.signal,
+      "screenshot capture aborted",
+    )) as BridgeResult;
+    // The bridge tracks frame age at the instant pixels are copied. The
+    // preflight state check alone has a race with a stalled stream, so reject
+    // stale pixels here as well and let capture's reconnect path rebuild it.
+    if (result.ageMs !== undefined && result.ageMs > 5_000) {
+      throw new JetKvmError("StaleCapture", `decoded video frame is ${result.ageMs}ms old`);
+    }
+    return result;
+  }
+
   async capture(opts: CaptureOptions): Promise<CaptureResult> {
     this.armIdleKill();
-    // Screenshots must reflect the CURRENT screen: accept a decoded frame at
-    // most 5s old; otherwise rebuild the session (fresh IDR on connect).
+    // A fresh document/peer guarantees the capture follows preceding input.
     const page = await abortable(
-      this.ensureConnected(5_000),
+      this.ensureConnected(),
       opts.signal,
       "screenshot capture aborted",
     );
     let r: BridgeResult;
     try {
-      r = (await abortable(
-        page.evaluate(
-          (o: { format: string; quality: number; maxModelWidth: number }) =>
-            window.__jetkvm.capture(o),
-          { format: opts.format, quality: opts.quality, maxModelWidth: opts.maxModelWidth },
-        ),
-        opts.signal,
-        "screenshot capture aborted",
-      )) as BridgeResult;
+      r = await this.capturePage(page, opts);
     } catch (err) {
       if (err instanceof JetKvmError && err.code === "Aborted") throw err;
       // Stream went stale (host reboot, resolution change): reconnect once.
@@ -257,15 +273,7 @@ export class BrowserEngine implements ScreenshotEngine {
         opts.signal,
         "screenshot capture aborted",
       );
-      r = (await abortable(
-        fresh.evaluate(
-          (o: { format: string; quality: number; maxModelWidth: number }) =>
-            window.__jetkvm.capture(o),
-          { format: opts.format, quality: opts.quality, maxModelWidth: opts.maxModelWidth },
-        ),
-        opts.signal,
-        "screenshot capture aborted",
-      )) as BridgeResult;
+      r = await this.capturePage(fresh, opts);
     }
     this.lastCaptureAt = Date.now();
     return {

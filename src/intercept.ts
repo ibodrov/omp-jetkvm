@@ -21,9 +21,9 @@ export function policyGate(policy: PolicyConfig, event: ToolCallEventLike): Inte
   switch (event.toolName) {
     case "jetkvm_device": {
       const action = input["action"];
-      if (action === "power" && !policy.allowPowerActions) {
+      if ((action === "power" || action === "wake") && !policy.allowPowerActions) {
         const op = String(input["op"] ?? "");
-        if (op === "atx-state" || op === "dc-state") return; // reads always allowed
+        if (action === "power" && (op === "atx-state" || op === "dc-state")) return; // reads always allowed
         return {
           block: true,
           reason: "power actions are disabled by jetkvm.policy.allowPowerActions=false",

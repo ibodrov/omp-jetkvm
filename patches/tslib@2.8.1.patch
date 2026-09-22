@@ -1,0 +1,87 @@
+diff --git a/modules/index.js b/modules/index.js
+index c91f61864fead99b3085eed82ae0aa8a098d83a8..784cbcee68b0631ebd79b01a9555ab55da491b3b 100644
+--- a/modules/index.js
++++ b/modules/index.js
+@@ -1,70 +1,13 @@
+-import tslib from '../tslib.js';
+-const {
+-    __extends,
+-    __assign,
+-    __rest,
+-    __decorate,
+-    __param,
+-    __esDecorate,
+-    __runInitializers,
+-    __propKey,
+-    __setFunctionName,
+-    __metadata,
+-    __awaiter,
+-    __generator,
+-    __exportStar,
+-    __createBinding,
+-    __values,
+-    __read,
+-    __spread,
+-    __spreadArrays,
+-    __spreadArray,
+-    __await,
+-    __asyncGenerator,
+-    __asyncDelegator,
+-    __asyncValues,
+-    __makeTemplateObject,
+-    __importStar,
+-    __importDefault,
+-    __classPrivateFieldGet,
+-    __classPrivateFieldSet,
+-    __classPrivateFieldIn,
+-    __addDisposableResource,
+-    __disposeResources,
+-    __rewriteRelativeImportExtension,
+-} = tslib;
+-export {
+-    __extends,
+-    __assign,
+-    __rest,
+-    __decorate,
+-    __param,
+-    __esDecorate,
+-    __runInitializers,
+-    __propKey,
+-    __setFunctionName,
+-    __metadata,
+-    __awaiter,
+-    __generator,
+-    __exportStar,
+-    __createBinding,
+-    __values,
+-    __read,
+-    __spread,
+-    __spreadArrays,
+-    __spreadArray,
+-    __await,
+-    __asyncGenerator,
+-    __asyncDelegator,
+-    __asyncValues,
+-    __makeTemplateObject,
+-    __importStar,
+-    __importDefault,
+-    __classPrivateFieldGet,
+-    __classPrivateFieldSet,
+-    __classPrivateFieldIn,
+-    __addDisposableResource,
+-    __disposeResources,
+-    __rewriteRelativeImportExtension,
+-};
++// Patched for omp 18's extension graph loader (2026-08).
++//
++// omp's loader pulls this file into its rewrite graph and serves every module
++// through Bun onLoad hooks with forced-ESM semantics — no CommonJS interop.
++// The upstream `import tslib from '../tslib.js'` default-imports the CJS
++// build, which has no ESM default export, so the whole graph fails with
++// "Missing 'default' export in module '.../tslib/tslib.js'". Re-export the
++// pure-ESM build instead; the namespace object keeps default-import parity
++// with the CJS module.exports shape.
++import * as tslib from "../tslib.es6.mjs";
++
++export * from "../tslib.es6.mjs";
+ export default tslib;

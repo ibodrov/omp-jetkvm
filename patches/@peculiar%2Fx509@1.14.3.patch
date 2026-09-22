@@ -1,0 +1,13 @@
+diff --git a/package.json b/package.json
+index 05424c34b9c57ab64b859ef14d96ac988c913ddf..2d0c56d45a16b73fceea7ea77e4c0b6e89d784e2 100644
+--- a/package.json
++++ b/package.json
+@@ -3,8 +3,6 @@
+   "version": "1.14.3",
+   "description": "@peculiar/x509 is an easy to use TypeScript/Javascript library based on @peculiar/asn1-schema that makes generating X.509 Certificates and Certificate Requests as well as validating certificate chains easy",
+   "main": "build/x509.cjs.js",
+-  "module": "build/x509.es.js",
+-  "unpkg": "build/x509.js",
+   "types": "build/index.d.ts",
+   "scripts": {
+     "test": "vitest run",

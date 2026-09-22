@@ -3,6 +3,8 @@ import { FakeDevice } from "./helpers/fake-device.ts";
 import { JsonRpcClient } from "../src/rpc.ts";
 import { RTCPeerConnection } from "werift";
 import { sdpCodec } from "../src/util.ts";
+import { DeviceSession } from "../src/connection.ts";
+import { JETKVM_CONFIG_DEFAULTS } from "../src/config.ts";
 
 /**
  * Integration: a real werift client session against the fake device
@@ -59,6 +61,72 @@ describe("fake device harness", () => {
       pc.close();
     } catch {
       // already closed
+    }
+  }, 20_000);
+
+  test("WebSocket-only firmware recovers video state and reconnects after token rotation", async () => {
+    const state = { videoWidth: 1280, videoHeight: 720 };
+    const device = new FakeDevice({ state });
+    let token = "";
+    let logins = 0;
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch(request, server) {
+        const path = new URL(request.url).pathname;
+        if (path === "/auth/login-local") {
+          token = `token-${++logins}`;
+          return new Response("ok", { headers: { "Set-Cookie": `authToken=${token}; Path=/` } });
+        }
+        // Removed routes don't run auth middleware on firmware 0.5.9.
+        if (path === "/webrtc/session") return new Response("not found", { status: 404 });
+        if (request.headers.get("cookie") !== `authToken=${token}`) {
+          return new Response("unauthorized", { status: 401 });
+        }
+        if (path === "/device") return Response.json({ authMode: "password" });
+        if (path === "/webrtc/signaling/client" && server.upgrade(request)) return;
+        return new Response("not found", { status: 404 });
+      },
+      websocket: {
+        open(ws) {
+          ws.send(JSON.stringify({ type: "device-metadata", data: { deviceVersion: "0.5.9" } }));
+        },
+        async message(ws, message) {
+          const frame = JSON.parse(String(message)) as { type?: string; data?: { sd?: string } };
+          if (frame.type !== "offer" || typeof frame.data?.sd !== "string") {
+            ws.close(1008, "expected offer");
+            return;
+          }
+          const answer = await device.handleSignaling(frame.data.sd);
+          ws.send(JSON.stringify({ type: "answer", data: answer }));
+        },
+      },
+    });
+    const session = new DeviceSession("ws-test", {
+      host: `127.0.0.1:${server.port}`,
+      password: "test-password",
+    }, structuredClone(JETKVM_CONFIG_DEFAULTS));
+    try {
+      expect(await session.call("ping")).toBe("pong");
+      expect(await session.videoDims()).toEqual({ width: 1280, height: 720 });
+      device.pushEvent("videoInputState", { ready: false, width: 0, height: 0, fps: 0, error: "no_signal" });
+      await session.call("ping"); // Ordered channel barrier: consume the preceding state event.
+      expect(session.videoState.error).toBe("no_signal");
+      device.pushEvent("videoInputState", { ready: true, width: 800, height: 600, fps: 60 });
+      await session.call("ping");
+      expect(session.videoState.error).toBeUndefined();
+      expect(await session.videoDims()).toEqual({ width: 800, height: 600 });
+      await session.dispose();
+      await device.close();
+      token = "rotated-by-another-client";
+      state.videoWidth = 1920;
+      state.videoHeight = 1080;
+      expect(await session.videoDims()).toEqual({ width: 1920, height: 1080 });
+      expect(logins).toBe(2);
+    } finally {
+      await session.dispose();
+      await device.close();
+      server.stop(true);
     }
   }, 20_000);
 });

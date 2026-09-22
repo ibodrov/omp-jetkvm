@@ -60,8 +60,8 @@ export async function getMountState(session: DeviceSession, signal?: AbortSignal
 const MOUNT_TIMEOUT_MS = 60_000;
 
 /** Single-slot rule (DESIGN §8): clear any active mount before a new one. */
-async function clearSlot(session: DeviceSession, policy: PolicyConfig): Promise<void> {
-  const state = await getMountState(session);
+async function clearSlot(session: DeviceSession, policy: PolicyConfig, signal?: AbortSignal): Promise<void> {
+  const state = await getMountState(session, signal);
   if (state === null || state === undefined) return;
   if (!policy.forceUnmountOnMount) {
     throw new JetKvmError(
@@ -70,7 +70,9 @@ async function clearSlot(session: DeviceSession, policy: PolicyConfig): Promise<
       { mounted: state },
     );
   }
-  await session.call("unmountImage", {}, { timeoutMs: MOUNT_TIMEOUT_MS });
+  await session.call("unmountImage", {}, { timeoutMs: MOUNT_TIMEOUT_MS, signal });
+
+
 }
 
 export async function mountUrl(
@@ -88,17 +90,16 @@ export async function mountUrl(
   } catch (err) {
     if (err instanceof JetKvmError && err.code === "Aborted") throw err;
     // Firmware 0.5.8 quirk: checkMountUrl probes the URL (we see the GET)
-    // but its handler errors internally (-32603). Treat as advisory only;
-    // mountWithHTTP below is the real gate and works.
+    if (!(err instanceof JetKvmError && deviceCodeOf(err) === -32603)) throw err;
     check = { usable: null, note: `checkMountUrl RPC failed: ${err instanceof Error ? err.message : String(err)}` };
   }
   if (check["usable"] === false) {
     throw new JetKvmError("MountUrlUnusable", `device cannot mount ${opts.url}: ${String(check["reason"] ?? "no reason given")}`, { check });
   }
   if (opts.signal?.aborted) throw new JetKvmError("Aborted", "mount URL operation aborted");
-  await clearSlot(session, policy);
+  await clearSlot(session, policy, opts.signal);
   try {
-    await session.call("mountWithHTTP", { url: opts.url, mode: opts.mode ?? "CDROM" }, { timeoutMs: MOUNT_TIMEOUT_MS });
+    await session.call("mountWithHTTP", { url: opts.url, mode: opts.mode ?? "CDROM" }, { timeoutMs: MOUNT_TIMEOUT_MS, signal: opts.signal });
   } catch (err) {
     if (firmwareLacks(err)) {
       throw new JetKvmError("FirmwareLacksMethod", `device firmware lacks mountWithHTTP (${String(err)})`);
@@ -107,6 +108,8 @@ export async function mountUrl(
   }
   return { check };
 }
+
+
 
 
 export async function mountFile(
@@ -423,7 +426,7 @@ export async function serveAndMount(
   const url = `http://${bindIp}:${server.port}/iso`;
   serveRegistry().set(session.auth.hostname, { server, url, since: Date.now() });
   try {
-    const { check } = await mountUrl(session, policy, { url, mode: opts.mode });
+    const { check } = await mountUrl(session, policy, { url, mode: opts.mode, signal: opts.signal });
     return {
       serving: url,
       file: basename(path),

@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { JetKvmError, timestampName } from "../util.ts";
 import { findRecorderBin, RecorderEngine } from "./engine-recorder.ts";
 import type { DeviceConfig, JetKvmConfig } from "../config.ts";
+import { BrowserEngine } from "./engine-browser.ts";
 
 /** Write a capture's full-res bytes to the screenshot dir; returns the path. */
 export function writeScreenshotFile(fullB64: string, mime: string, dir: string): string {
@@ -80,8 +81,7 @@ export function findChromium(explicitPath: string): string | null {
 }
 
 export async function selectEngine(cfg: JetKvmConfig, dev: DeviceConfig): Promise<ScreenshotEngine> {
-  // Config values are not schema-validated at load; catch unknowns here so
-  // a typo reports itself instead of silently falling through to "auto".
+  // Also validate direct in-memory callers that bypass config loading.
   const wanted: string = cfg.screenshot.engine;
   if (wanted !== "auto" && wanted !== "browser" && wanted !== "recorder") {
     throw new JetKvmError("ConfigError", `unknown screenshot engine "${wanted}" — use auto, browser, or recorder`);
@@ -89,14 +89,6 @@ export async function selectEngine(cfg: JetKvmConfig, dev: DeviceConfig): Promis
   if (wanted === "browser" || wanted === "auto") {
     const chromium = findChromium(cfg.screenshot.chromiumPath);
     if (chromium) {
-      // Lazy + runtime-built specifier: omp's loader pre-walks literal
-      // dynamic imports and forces ESM over the snapshot, which breaks
-      // puppeteer-core's CJS deps (tslib & friends). A computed specifier
-      // keeps the walk empty; the module loads natively at selection time.
-      const browserEngineModule = "./engine-browser" + ".ts";
-      const { BrowserEngine } = (await import(browserEngineModule)) as {
-        BrowserEngine: new (path: string, dev: DeviceConfig, cfg: JetKvmConfig) => ScreenshotEngine;
-      };
       return new BrowserEngine(chromium, dev, cfg);
     }
     if (wanted === "browser") {

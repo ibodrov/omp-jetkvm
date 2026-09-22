@@ -201,9 +201,9 @@ export const MOUSE_BUTTONS = { left: 1, right: 2, middle: 4 } as const;
  * pressed by someone else (human at the local UI, another machine) — surface
  * it as a warning so agents know the field isn't clean. Heuristic only.
  */
-export async function foreignInputCheck(session: DeviceSession, warnings: string[]): Promise<void> {
+export async function foreignInputCheck(session: DeviceSession, warnings: string[], signal?: AbortSignal): Promise<void> {
   try {
-    const down = (await session.call("getKeyDownState", {}, { timeoutMs: 3_000 })) as {
+    const down = (await session.call("getKeyDownState", {}, { timeoutMs: 3_000, retryOnReconnect: true, signal })) as {
       modifier?: number;
       keys?: number[];
     };
@@ -281,8 +281,10 @@ export async function runInputTransaction<T>(
   };
 
   try {
+    await foreignInputCheck(session, warnings, opts.signal);
+    // The idempotent baseline may reconnect after a screenshot replaces the
+    // control peer, so acquire the process claim only after that recovery.
     session.ensureClaim(opts.force);
-    await foreignInputCheck(session, warnings);
     if (opts.signal?.aborted) {
       throw new JetKvmError("Aborted", "input transaction aborted");
     }
@@ -292,18 +294,22 @@ export async function runInputTransaction<T>(
     const result = await fn(tx);
     return { result, warnings };
   } finally {
-    // Cleanup invariant: release anything that may have reached the device,
-    // best-effort, before unlock. Cleanup intentionally ignores the caller's
-    // aborted signal.
-    try {
-      if (held.modifierMask !== 0 || held.keyUsages.length > 0) {
+    // Cleanup invariant: release each HID report independently. A lost
+    // keyboard response must not prevent the mouse release (or vice versa).
+    // Cleanup intentionally ignores the caller's aborted signal.
+    if (held.modifierMask !== 0 || held.keyUsages.length > 0) {
+      try {
         await session.call("keyboardReport", { modifier: 0, keys: hidKeysPayload([]) });
+      } catch {
+        // connection already gone; device-side HID times held keys out on disconnect
       }
-      if (held.buttons !== 0) {
+    }
+    if (held.buttons !== 0) {
+      try {
         await session.call("absMouseReport", { x: held.pointer.x, y: held.pointer.y, buttons: 0 });
+      } catch {
+        // connection already gone; device-side HID times held buttons out on disconnect
       }
-    } catch {
-      // connection already gone; device-side HID times held keys out on disconnect
     }
     release();
   }
@@ -318,9 +324,13 @@ export async function runInputTransaction<T>(
 export async function releaseAllInput(session: DeviceSession, at?: { x: number; y: number }): Promise<void> {
   // Best-effort device-side release; the drain must run even when the
   // channel is already gone (the device times held keys out on disconnect).
+  const p = at ?? session.lastMouse;
   try {
     await session.call("keyboardReport", { modifier: 0, keys: hidKeysPayload([]) });
-    const p = at ?? session.lastMouse;
+  } catch {
+    // channel gone
+  }
+  try {
     await session.call("absMouseReport", { x: p?.x ?? 0, y: p?.y ?? 0, buttons: 0 });
   } catch {
     // channel gone
@@ -332,6 +342,7 @@ export async function releaseAllInput(session: DeviceSession, at?: { x: number; 
 // ---------------------------------------------------------------------------
 // Higher-level operations (used by the tools)
 // ---------------------------------------------------------------------------
+
 
 export interface TypeOptions {
   text: string;

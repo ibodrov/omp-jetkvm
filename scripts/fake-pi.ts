@@ -69,4 +69,4 @@ for (const block of result.content) {
 console.log("[details]", JSON.stringify(result.details, null, 2));
 await ConnectionManager.disposeAll();
 await disposeEngines();
-process.exit(0);
+process.exit(result.isError ? 1 : 0);

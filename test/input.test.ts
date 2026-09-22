@@ -11,6 +11,7 @@ import {
   typeText,
   type InputTransaction,
 } from "../src/input.ts";
+import { policyGate } from "../src/intercept.ts";
 import { JetKvmError, pixelToHid, routeSourceAddress, sdpCodec } from "../src/util.ts";
 
 describe("USB HID keymap (HID Usage Tables)", () => {
@@ -232,5 +233,13 @@ describe("foreignInputCheck", () => {
     };
     await foreignInputCheck(absent as unknown as Parameters<typeof foreignInputCheck>[0], warnings);
     expect(warnings).toEqual([]);
+  });
+});
+
+describe("device policy gates", () => {
+  test("wake is blocked when power actions are disabled", () => {
+    const policy = { allowPowerActions: false, allowUsbDisconnect: false, forceUnmountOnMount: true };
+    expect(policyGate(policy, { toolName: "jetkvm_device", input: { action: "wake" } })).toMatchObject({ block: true });
+    expect(policyGate({ ...policy, allowPowerActions: true }, { toolName: "jetkvm_device", input: { action: "wake" } })).toBeUndefined();
   });
 });

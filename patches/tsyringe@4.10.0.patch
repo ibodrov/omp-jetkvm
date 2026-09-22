@@ -1,0 +1,13 @@
+diff --git a/package.json b/package.json
+index 49d94583e10a756d8a39fa5a0412f8ee654ab1bc..5feb91e4000261257dc20ab1af7be2fb7fe34e6a 100644
+--- a/package.json
++++ b/package.json
+@@ -3,8 +3,6 @@
+   "version": "4.10.0",
+   "description": "Lightweight dependency injection container for JavaScript/TypeScript",
+   "main": "dist/cjs/index.js",
+-  "module": "./dist/esm5/index.js",
+-  "es2015": "./dist/esm2015/index.js",
+   "typings": "./dist/typings/index.d.ts",
+   "scripts": {
+     "build": "yarn clean && yarn build:cjs && yarn build:es5 && yarn build:es2015 && yarn build:types",

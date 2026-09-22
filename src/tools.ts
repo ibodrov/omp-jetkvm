@@ -672,7 +672,7 @@ export function buildDeviceTool(cfg: JetKvmConfig, z: ZodLike): ToolDefinitionLi
             const status = await getDeviceStatus(session, signal);
             const atx = status.atxState as { power?: boolean } | null;
             return {
-              content: [text(`device ${session.auth.hostname}: fw ${JSON.stringify(status.localVersion)}; ${atx?.power === true ? "host POWERED ON" : atx?.power === false ? "host powered off" : "host power unknown"}; video ${JSON.stringify(status.videoState)}; layout ${JSON.stringify(status.keyboardLayout)}; media ${JSON.stringify(status.virtualMedia)}`)],
+              content: [text(`device ${session.auth.hostname}: fw ${JSON.stringify(status.localVersion)}; ATX power sensor ${atx?.power === true ? "on" : atx?.power === false ? "off (not authoritative if unwired)" : "unknown"}; video ${JSON.stringify(status.videoState)}; layout ${JSON.stringify(status.keyboardLayout)}; media ${JSON.stringify(status.virtualMedia)}`)],
               details: { ...status, device: session.name },
             };
           }

@@ -49,7 +49,7 @@ export interface JetKvmConfig {
   policy: PolicyConfig;
 }
 
-const DEFAULTS: JetKvmConfig = {
+export const JETKVM_CONFIG_DEFAULTS: JetKvmConfig = {
   devices: {},
   screenshot: {
     engine: "auto",
@@ -162,7 +162,7 @@ let cached: { key: string; config: JetKvmConfig } | null = null;
  * so callers can decide how to surface "not configured".
  */
 export function loadJetKvmConfig(cwd: string): JetKvmConfig {
-  let config: JetKvmConfig = structuredClone(DEFAULTS);
+  let config: JetKvmConfig = structuredClone(JETKVM_CONFIG_DEFAULTS);
   const stamp: string[] = [];
   for (const path of candidatePaths(cwd)) {
     if (!existsSync(path)) continue;

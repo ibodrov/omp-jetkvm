@@ -6,8 +6,9 @@
 </head>
 <body>
 <!-- Self-contained decode bridge: the extension process owns ALL device HTTP
-     (login, signaling POST); this page only renders the negotiated stream and
-     returns pixels. No credentials ever live here beyond single-use SDP. -->
+     and WebSocket signaling (login, SDP exchange); this page only renders
+     the negotiated stream and returns pixels. No credentials ever live here
+     beyond single-use SDP. -->
 <video id="v" muted playsinline autoplay></video>
 <script>
 (() => {
@@ -15,29 +16,52 @@
   let pc = null;
   let frameReady = false;
   let lastFrameAt = 0;
+  let frameGeneration = 0;
+  let frameCallbackId = null;
+  let remoteDescriptionSet = false;
+  let pendingCandidates = [];
 
-  function onFrame() {
-    frameReady = true;
-    lastFrameAt = performance.now();
-    // keep watching so captures always see a recent frame
-    video.requestVideoFrameCallback(onFrame);
+  function cancelFrameWatch() {
+    frameGeneration++;
+    if (frameCallbackId !== null) {
+      try { video.cancelVideoFrameCallback(frameCallbackId); } catch (e) {}
+      frameCallbackId = null;
+    }
+  }
+
+  function watchFrames(generation) {
+    frameCallbackId = video.requestVideoFrameCallback(() => {
+      if (generation !== frameGeneration || !pc) return;
+      frameReady = true;
+      lastFrameAt = performance.now();
+      watchFrames(generation);
+    });
   }
 
   window.__jetkvm = {
     async createOffer() {
-      if (pc) { try { pc.close(); } catch (e) {} pc = null; frameReady = false; }
+      cancelFrameWatch();
+      if (pc) { try { pc.close(); } catch (e) {} }
+      pc = null;
+      frameReady = false;
+      lastFrameAt = 0;
+      remoteDescriptionSet = false;
+      pendingCandidates = [];
+      video.srcObject = null;
+      video.load();
+      const generation = frameGeneration;
       pc = new RTCPeerConnection();
       pc.addTransceiver("video", { direction: "recvonly" });
       pc.ontrack = (ev) => {
+        if (generation !== frameGeneration || !pc) return;
         video.srcObject = ev.streams[0];
         video.play().catch(() => {});
-        video.requestVideoFrameCallback(onFrame);
+        watchFrames(generation);
       };
       const offer = await pc.createOffer();
-      // The device switches to candidate-trickle (over a WebSocket we never
-      // open) when the offer advertises trickle support — Chrome always does.
-      // Strip it so the answer arrives candidate-complete (non-trickle), the
-      // same exchange werift's control session uses.
+      // Keep local ICE candidates in the SDP for legacy HTTP signaling.
+      // New firmware may still trickle remote candidates over WebSocket;
+      // the extension forwards those through addCandidate().
       offer.sdp = offer.sdp.replace(/a=ice-options:trickle\r?\n/g, "");
       await pc.setLocalDescription(offer);
       await new Promise((resolve) => {
@@ -52,6 +76,13 @@
       if (!pc) throw new Error("no offer created");
       const desc = JSON.parse(atob(b64));
       await pc.setRemoteDescription(desc);
+      remoteDescriptionSet = true;
+      for (const candidate of pendingCandidates.splice(0)) await pc.addIceCandidate(candidate);
+    },
+    async addCandidate(candidate) {
+      if (!pc) throw new Error("no offer created");
+      if (remoteDescriptionSet) await pc.addIceCandidate(candidate);
+      else pendingCandidates.push(candidate);
     },
     async waitFrame(timeoutMs = 15000) {
       const t0 = Date.now();
@@ -92,11 +123,15 @@
       };
     },
     close() {
+      cancelFrameWatch();
       if (pc) { try { pc.close(); } catch (e) {} }
       pc = null;
       frameReady = false;
       lastFrameAt = 0;
       video.srcObject = null;
+      video.load();
+      remoteDescriptionSet = false;
+      pendingCandidates = [];
     },
   };
 })();
