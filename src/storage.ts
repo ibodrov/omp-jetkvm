@@ -60,8 +60,14 @@ export async function getMountState(session: DeviceSession, signal?: AbortSignal
 const MOUNT_TIMEOUT_MS = 60_000;
 
 /** Single-slot rule (DESIGN §8): clear any active mount before a new one. */
-async function clearSlot(session: DeviceSession, policy: PolicyConfig, signal?: AbortSignal): Promise<void> {
-  const state = await getMountState(session, signal);
+async function clearSlot(
+  session: DeviceSession,
+  policy: PolicyConfig,
+  signal?: AbortSignal,
+  knownState?: VirtualMediaState | null,
+): Promise<void> {
+  const state = knownState === undefined ? await getMountState(session, signal) : knownState;
+  if (signal?.aborted) throw new JetKvmError("Aborted", "storage operation aborted before mutation");
   if (state === null || state === undefined) return;
   if (!policy.forceUnmountOnMount) {
     throw new JetKvmError(
@@ -70,9 +76,8 @@ async function clearSlot(session: DeviceSession, policy: PolicyConfig, signal?: 
       { mounted: state },
     );
   }
+  if (signal?.aborted) throw new JetKvmError("Aborted", "storage operation aborted before unmount");
   await session.call("unmountImage", {}, { timeoutMs: MOUNT_TIMEOUT_MS, signal });
-
-
 }
 
 export async function mountUrl(
@@ -97,7 +102,10 @@ export async function mountUrl(
     throw new JetKvmError("MountUrlUnusable", `device cannot mount ${opts.url}: ${String(check["reason"] ?? "no reason given")}`, { check });
   }
   if (opts.signal?.aborted) throw new JetKvmError("Aborted", "mount URL operation aborted");
+  const previousUrl = serveRegistry().get(session.auth.origin)?.url;
   await clearSlot(session, policy, opts.signal);
+  if (opts.signal?.aborted) throw new JetKvmError("Aborted", "mount URL operation aborted");
+  if (previousUrl && previousUrl !== opts.url) stopServeServer(session);
   try {
     await session.call("mountWithHTTP", { url: opts.url, mode: opts.mode ?? "CDROM" }, { timeoutMs: MOUNT_TIMEOUT_MS, signal: opts.signal });
   } catch (err) {
@@ -109,34 +117,32 @@ export async function mountUrl(
   return { check };
 }
 
-
-
-
 export async function mountFile(
   session: DeviceSession,
   policy: PolicyConfig,
-  opts: { filename: string; mode?: MountMode },
+  opts: { filename: string; mode?: MountMode; signal?: AbortSignal },
 ): Promise<Record<string, unknown>> {
-  await clearSlot(session, policy);
-  await session.call("mountWithStorage", { filename: opts.filename, mode: opts.mode ?? "CDROM" }, { timeoutMs: MOUNT_TIMEOUT_MS });
-  return (await getMountState(session)) as Record<string, unknown>;
+  await clearSlot(session, policy, opts.signal);
+  if (opts.signal?.aborted) throw new JetKvmError("Aborted", "mount file operation aborted");
+  stopServeServer(session);
+  await session.call("mountWithStorage", { filename: opts.filename, mode: opts.mode ?? "CDROM" }, { timeoutMs: MOUNT_TIMEOUT_MS, signal: opts.signal });
+  return (await getMountState(session, opts.signal)) as Record<string, unknown>;
 }
 
-export async function unmount(session: DeviceSession): Promise<Record<string, unknown>> {
+export async function unmount(session: DeviceSession, signal?: AbortSignal): Promise<Record<string, unknown>> {
   // Stop the server only after unmountImage is acknowledged. A timeout or
   // connection error is ambiguous: the media may still be mounted, and
   // killing its server in that state wedges the firmware storage handler.
-  await session.call("unmountImage", {}, { timeoutMs: MOUNT_TIMEOUT_MS });
+  await session.call("unmountImage", {}, { timeoutMs: MOUNT_TIMEOUT_MS, signal });
   stopServeServer(session);
-  return { unmounted: true, state: await getMountState(session) };
+  return { unmounted: true, state: await getMountState(session, signal) };
 }
 
-export async function deleteFile(session: DeviceSession, filename: string): Promise<Record<string, unknown>> {
-  const before = await getSpace(session);
-  await session.call("deleteStorageFile", { filename });
-  return { deleted: filename, bytesFreeBefore: before.bytesFree, state: await getMountState(session) };
+export async function deleteFile(session: DeviceSession, filename: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
+  const before = await getSpace(session, signal);
+  await session.call("deleteStorageFile", { filename }, { signal });
+  return { deleted: filename, bytesFreeBefore: before.bytesFree, state: await getMountState(session, signal) };
 }
-
 // ---------------------------------------------------------------------------
 // Resumable upload (DESIGN §4.4 flow)
 // ---------------------------------------------------------------------------
@@ -206,7 +212,7 @@ export async function uploadFile(session: DeviceSession, opts: UploadOptions): P
   const dataChannel = start["dataChannel"];
   const offset = start["alreadyUploadedBytes"];
   if (offset >= stat.size) {
-    return { filename, totalBytes: stat.size, resumedFrom: offset, state: await getMountState(session) };
+    return { filename, totalBytes: stat.size, resumedFrom: offset, state: await getMountState(session, opts.signal) };
   }
   const space = await getSpace(session, opts.signal);
   const remaining = stat.size - offset;
@@ -234,6 +240,9 @@ export async function uploadFile(session: DeviceSession, opts: UploadOptions): P
     }),
   );
 
+  await session.ensureConnected(opts.signal);
+  session.ensureClaim();
+  if (opts.signal?.aborted) throw new JetKvmError("Aborted", "upload aborted before request");
   const resp = await session.auth.authedFetch(
     `/storage/upload?uploadId=${encodeURIComponent(dataChannel)}`,
     {
@@ -253,7 +262,7 @@ export async function uploadFile(session: DeviceSession, opts: UploadOptions): P
     );
   }
   opts.onProgress?.({ bytesSent: stat.size, totalBytes: stat.size });
-  return { filename, totalBytes: stat.size, resumedFrom: offset, state: await getMountState(session) };
+  return { filename, totalBytes: stat.size, resumedFrom: offset, state: await getMountState(session, opts.signal) };
 }
 
 // ---------------------------------------------------------------------------
@@ -294,26 +303,32 @@ export function parseRange(header: string | null, total: number): { start: numbe
 }
 
 export function stopServeServer(session: DeviceSession): void {
-  const entry = serveRegistry().get(session.auth.hostname);
+  const key = session.auth.origin;
+  const entry = serveRegistry().get(key);
   if (entry) {
     entry.server.stop(true);
-    serveRegistry().delete(session.auth.hostname);
+    serveRegistry().delete(key);
   }
 }
 
 /**
  * Retire a previous serve server safely: when the media it serves is still
  * mounted, unmount FIRST (policy-aware) — a server death under an active
- * mount wedges the device's storage handler (README "Firmware quirks").
- * Policy refusal (VirtualMediaBusy) propagates and leaves the server alive.
+ * mount wedges the device's storage handler.
  */
-export async function retireServeServer(session: DeviceSession, policy: PolicyConfig): Promise<void> {
-  const entry = serveRegistry().get(session.auth.hostname);
+export async function retireServeServer(
+  session: DeviceSession,
+  policy: PolicyConfig,
+  signal?: AbortSignal,
+): Promise<void> {
+  const key = session.auth.origin;
+  const entry = serveRegistry().get(key);
   if (!entry) return;
   let state: VirtualMediaState | null;
   try {
-    state = await getMountState(session);
+    state = await getMountState(session, signal);
   } catch (err) {
+    if (signal?.aborted) throw new JetKvmError("Aborted", "storage retirement aborted while reading media state");
     // Unknown is not equivalent to unmounted. Keep serving rather than risk
     // wedging a device that still range-reads this URL.
     throw new JetKvmError(
@@ -322,30 +337,30 @@ export async function retireServeServer(session: DeviceSession, policy: PolicyCo
       { cause: err instanceof Error ? err.message : String(err) },
     );
   }
-  if (state?.url && state.url === entry.url) {
-    await clearSlot(session, policy);
+  if (state?.url === entry.url) {
+    await clearSlot(session, policy, signal, state);
   }
+  if (signal?.aborted) throw new JetKvmError("Aborted", "storage retirement aborted before stopping the server");
   stopServeServer(session);
 }
 
 /**
- * session_shutdown path: best-effort unmount-then-stop, never throws. Force
- * unmount here — the alternative is the server dying under an active mount,
- * which is the documented device wedge.
+ * session_shutdown path: best-effort bounded unmount-then-stop, never throws.
+ * Force unmount here — dying under an active mount can wedge firmware.
  */
 export async function shutdownServe(session: DeviceSession): Promise<void> {
+  const entry = serveRegistry().get(session.auth.origin);
+  if (!entry) return;
+  const signal = AbortSignal.timeout(5_000);
   try {
-    if (session.state === "connected") {
-      await retireServeServer(session, {
-        allowPowerActions: true,
-        allowUsbDisconnect: false,
-        forceUnmountOnMount: true,
-      });
-    }
+    await retireServeServer(session, {
+      allowPowerActions: true,
+      allowUsbDisconnect: false,
+      forceUnmountOnMount: true,
+    }, signal);
   } catch {
-    // device gone: process exit stops the server regardless
+    // A failed or timed-out state/unmount leaves uncertain media; keep serving.
   }
-  stopServeServer(session);
 }
 
 export async function serveAndMount(
@@ -379,7 +394,7 @@ export async function serveAndMount(
   // Unmount any media our previous server is still serving before stopping
   // it (retireServeServer); a fresh server dying under a live mount is the
   // documented wedge.
-  await retireServeServer(session, policy);
+  await retireServeServer(session, policy, opts.signal);
   const file: BunFile = Bun.file(path);
   const server = Bun.serve({
     hostname: bindIp,
@@ -424,7 +439,7 @@ export async function serveAndMount(
     },
   });
   const url = `http://${bindIp}:${server.port}/iso`;
-  serveRegistry().set(session.auth.hostname, { server, url, since: Date.now() });
+  serveRegistry().set(session.auth.origin, { server, url, since: Date.now() });
   try {
     const { check } = await mountUrl(session, policy, { url, mode: opts.mode, signal: opts.signal });
     return {
@@ -449,6 +464,6 @@ export async function serveAndMount(
 }
 
 export function serveSnapshot(session: DeviceSession): Record<string, unknown> | null {
-  const entry = serveRegistry().get(session.auth.hostname);
+  const entry = serveRegistry().get(session.auth.origin);
   return entry ? { url: entry.url, since: new Date(entry.since).toISOString() } : null;
 }

@@ -218,6 +218,36 @@ export async function foreignInputCheck(session: DeviceSession, warnings: string
   }
 }
 
+/** Attempt every required zero report; a failed acknowledgement is not a release. */
+async function releaseInputReports(
+  session: DeviceSession,
+  reports: { keyboard: boolean; pointer?: { x: number; y: number } },
+): Promise<void> {
+  const failures: { report: "keyboard" | "mouse"; code: string }[] = [];
+  if (reports.keyboard) {
+    try {
+      await session.call("keyboardReport", { modifier: 0, keys: hidKeysPayload([]) });
+    } catch (error) {
+      failures.push({ report: "keyboard", code: error instanceof JetKvmError ? error.code : "UnexpectedError" });
+    }
+  }
+  if (reports.pointer) {
+    session.lastMouse = reports.pointer;
+    try {
+      await session.call("absMouseReport", { ...reports.pointer, buttons: 0 });
+    } catch (error) {
+      failures.push({ report: "mouse", code: error instanceof JetKvmError ? error.code : "UnexpectedError" });
+    }
+  }
+  if (failures.length > 0) {
+    throw new JetKvmError(
+      "InputReleaseFailed",
+      "device did not acknowledge every input release; keys or buttons may still be held",
+      { failedReports: failures },
+    );
+  }
+}
+
 /**
  * Run one atomic input transaction under the per-device input mutex with the
  * cross-process claim, guaranteeing the cleanup invariant on every exit path.
@@ -244,6 +274,7 @@ export async function runInputTransaction<T>(
   };
   const warnings: string[] = [];
   const startedAt = Date.now();
+  let operationError: unknown;
 
 
   const tx: InputTransaction = {
@@ -293,25 +324,23 @@ export async function runInputTransaction<T>(
     }
     const result = await fn(tx);
     return { result, warnings };
+  } catch (error) {
+    operationError = error;
+    throw error;
   } finally {
-    // Cleanup invariant: release each HID report independently. A lost
-    // keyboard response must not prevent the mouse release (or vice versa).
-    // Cleanup intentionally ignores the caller's aborted signal.
-    if (held.modifierMask !== 0 || held.keyUsages.length > 0) {
-      try {
-        await session.call("keyboardReport", { modifier: 0, keys: hidKeysPayload([]) });
-      } catch {
-        // connection already gone; device-side HID times held keys out on disconnect
-      }
+    // Cleanup ignores caller cancellation, attempts both reports, and cannot
+    // turn a failed device release into a successful transaction result.
+    try {
+      await releaseInputReports(session, {
+        keyboard: held.modifierMask !== 0 || held.keyUsages.length > 0,
+        pointer: held.buttons !== 0 ? held.pointer : undefined,
+      });
+    } catch (error) {
+      if (error instanceof Error && operationError !== undefined) error.cause = operationError;
+      throw error;
+    } finally {
+      release();
     }
-    if (held.buttons !== 0) {
-      try {
-        await session.call("absMouseReport", { x: held.pointer.x, y: held.pointer.y, buttons: 0 });
-      } catch {
-        // connection already gone; device-side HID times held buttons out on disconnect
-      }
-    }
-    release();
   }
 }
 /**
@@ -322,20 +351,14 @@ export async function runInputTransaction<T>(
  * pointer position (or `at`) so releasing never teleports the cursor.
  */
 export async function releaseAllInput(session: DeviceSession, at?: { x: number; y: number }): Promise<void> {
-  // Best-effort device-side release; the drain must run even when the
-  // channel is already gone (the device times held keys out on disconnect).
-  const p = at ?? session.lastMouse;
   try {
-    await session.call("keyboardReport", { modifier: 0, keys: hidKeysPayload([]) });
-  } catch {
-    // channel gone
+    await releaseInputReports(session, {
+      keyboard: true,
+      pointer: at ?? session.lastMouse ?? { x: 0, y: 0 },
+    });
+  } finally {
+    for (const release of heldInputReleases(session)) release();
   }
-  try {
-    await session.call("absMouseReport", { x: p?.x ?? 0, y: p?.y ?? 0, buttons: 0 });
-  } catch {
-    // channel gone
-  }
-  for (const rel of heldInputReleases(session)) rel();
 }
 
 

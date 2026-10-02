@@ -50,16 +50,24 @@ Full schema and design rationale: `DESIGN.md`.
 
 ## Screenshot engines
 
-- **browser** (default): a bundled page in headless Chromium decodes the H.264 High-profile stream via libwebrtc. Device login and HTTP/WebSocket signaling happen in the extension process; the page only renders and returns pixels. Chromium stays warm, but each capture resets the page and negotiates a fresh video peer so cached frames cannot hide recent input. Requires a Chromium with proprietary codecs (`/usr/bin/chromium` works on Arch). Launched with `--disable-features=WebRtcHideLocalIpsWithMdns` — the device cannot resolve mDNS-obfuscated ICE candidates.
-- **recorder**: shells out to [`recorder-for-jetkvm --screenshot`](https://github.com/ibodrov/jetkvm-recorder) when installed. One-shot PNG; the model copy is not downscaled (no decoder in this path).
+- **browser** (default): a bundled page in headless Chromium decodes the H.264 High-profile stream via libwebrtc. Device login and HTTP/WebSocket signaling happen in the extension process; the page only renders and returns pixels. Chromium stays warm, but each capture resets the page and negotiates a fresh video peer so cached frames cannot hide recent input. A closed cached page is rebuilt within the capture; launch errors are reported rather than becoming unhandled child-process errors. Requires a Chromium with proprietary codecs (`/usr/bin/chromium` works on Arch). Launched with `--disable-features=WebRtcHideLocalIpsWithMdns` — the device cannot resolve mDNS-obfuscated ICE candidates.
+- **recorder**: shells out to [`recorder-for-jetkvm --screenshot`](https://github.com/ibodrov/jetkvm-recorder) when installed. Preserves the configured origin, including HTTPS, and uses the same `password` → `passwordEnv` → `passwordFile` precedence as control/browser authentication. The effective password is supplied through a temporary `0600` file, removed when capture finishes. Child stderr is not exposed, capture is bounded to 30 seconds, and disposal cancels and awaits active children. One-shot PNG; the model copy is not downscaled (no decoder in this path).
+
+Mouse coordinates are full-resolution stream pixels (`details.coordinateSpace`), not pixels in a downscaled inline preview. Scale preview positions to the reported native dimensions before clicking.
+
+Screenshot output requires a real directory owned by the current user. Existing owned directories are tightened to `0700`; symlink and foreign-owned output directories are rejected. New full-resolution files use unique names, exclusive creation, and `0600` permissions. Captures are retained until explicitly deleted; treat their contents as sensitive.
 
 ## Concurrency & safety
 - One input transaction at a time per device (in-process mutex, holder reported on contention).
 - Manual holds (keyboard `down`/`hold_keys`, mouse `down`) park the input mutex until `up`/`release_all`; a dropped connection drains them so the lock never sticks.
-- Cross-process claim (abstract socket on Linux) so two omp sessions on one machine don't both drive HID; stale sidecars are reclaimed automatically, a live Linux kernel claim cannot be force-stolen, and `concurrency.crossProcess: none` disables claiming.
-- Input never auto-retries across reconnects (replay danger). Any abort/error mid-transaction releases all held keys/buttons. Reconnect backoff happens before the input mutex is taken, so a down device never starves other callers into `InputBusy`.
-- Connections (including the browser screenshot engine) share one auth session per device — the device rotates its single token on every login, so parallel logins would invalidate each other.
+- Cross-process claims identify a device by normalized origin (scheme, host, and port), not its configured alias. Linux uses an abstract socket released by the kernel on process death; a live kernel claim cannot be force-stolen. Other platforms use exclusive file publication with owner tokens: incomplete or malformed records fail closed, and release checks the stored owner token before deleting metadata. `concurrency.crossProcess: none` disables claiming.
+- Mutating RPCs never auto-retry across reconnects (replay danger). Ownership is revalidated after connection preflight, immediately before sending each mutation; uploads also check ownership before posting data. Cancellation cannot undo an already-sent mutation.
+- Abort/error cleanup attempts keyboard and mouse releases independently. An unacknowledged release surfaces `InputReleaseFailed` rather than success, while local parked holds and mutexes are drained. Mouse `up` still releases at the last HID position if optional coordinate conversion fails; an explicit release position is retained for subsequent reports.
+- Reconnect backoff happens before the input mutex is taken. Connection attempts have a 30-second deadline and teardown cancels pending signaling before waiting for it. Only caller activity resets idle expiry; keepalives and unsolicited events do not, and active RPC calls prevent idle disconnect.
+- Connections (including the browser screenshot engine) share one auth session per device — the device rotates its single token on every login, so parallel logins would invalidate each other. Shared login has an independent 10-second deadline; canceling one waiter does not cancel authentication for the others.
 - The device has no input interlock: a human at the local UI (or another machine) can inject concurrently; the tools surface "foreign input suspected" warnings when detectable.
+
+After upgrading, restart **all** running omp sessions before using mutating tools. Old loaded code uses the previous claim identity and cannot coordinate safely with the new origin-based claims.
 
 ### serve_and_mount networking
 
@@ -70,11 +78,18 @@ device-authenticated: other hosts on that subnet can read the served image
 while the mount is active. Use `upload_and_mount` for sensitive media, or
 scope exposure with firewall rules.
 
-A new `serve_and_mount` (and session shutdown) unmounts the previously
-served media first while its server is still alive — stopping a server
-under an active mount wedges the device's storage handler (see firmware
-quirks below). Policy `forceUnmountOnMount: false` refuses instead and
-leaves the old server running.
+Servers are tracked per normalized device origin, including scheme and port.
+A new `serve_and_mount` retires the previous served mount while its server is
+still alive. Successful replacement by a stored file or another URL also stops
+the obsolete server. `forceUnmountOnMount: false` refuses automatic replacement
+and leaves the old server running.
+
+Session shutdown attempts to reconnect and unmount owned served media even
+when the control session is idle, with a five-second cleanup deadline.
+If unmount cannot be confirmed, the server is deliberately left running:
+stopping it under a potentially active mount wedges the storage handler
+(see firmware quirks below). In that case, keep the process alive and explicitly
+unmount before exiting; process exit necessarily ends local serving.
 
 ## Firmware quirks observed (0.5.8)
 
@@ -105,7 +120,7 @@ leaves the old server running.
   stackless errors from non-werift Bun sockets. It only affects omp started
   from this directory; the installed extension's fix does not depend on it.
 - Connection teardown clears cached video dimensions, and reconnect/dispose invalidate in-flight peers so old coordinates or sessions cannot be republished.
-- Input cleanup attempts keyboard and mouse releases independently. URL mounting propagates cancellation through preflight, slot clearing, and mounting; only the known `checkMountUrl` device error `-32603` is advisory.
+- Storage cancellation propagates through preflight, slot clearing, mounting, deletion, unmounting, upload, and served-media retirement. Cancellation or an ambiguous mount failure preserves a server that may still back active media; only the known `checkMountUrl` device error `-32603` is advisory.
 - `allowPowerActions: false` blocks Wake-on-LAN as well as ATX writes. ATX status is reported as a sensor reading, not proof that an unwired host is off.
 
 ## omp loader note (omp ≥ 18: literal imports + dependency patches)

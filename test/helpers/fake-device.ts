@@ -25,9 +25,14 @@ export class FakeDevice {
   readonly inputs: RecordedInput[] = [];
   private pc: RTCPeerConnection | null = null;
   private dc: RTCDataChannel | null = null;
+  private dropMethod: string | null = null;
 
   constructor(private readonly opts: FakeDeviceOptions = {}) {}
 
+
+  dropNextResponse(method: string): void {
+    this.dropMethod = method;
+  }
   /**
    * Accept an encoded offer (the same `sd` payload the extension POSTs),
    * return the encoded answer. Mirrors POST /webrtc/session.
@@ -61,6 +66,10 @@ export class FakeDevice {
     if (typeof method !== "string") return;
     this.inputs.push({ method, params: (msg["params"] ?? {}) as Record<string, unknown> });
     const result = this.dispatch(method);
+    if (method === this.dropMethod) {
+      this.dropMethod = null;
+      return;
+    }
     if (typeof id === "number") {
       this.dc?.send(JSON.stringify({ jsonrpc: "2.0", id, result }));
     }

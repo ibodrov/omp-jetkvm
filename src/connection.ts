@@ -8,7 +8,7 @@
  */
 import { RTCPeerConnection, type RTCDataChannel } from "werift";
 import { JsonRpcClient, type RpcEvent } from "./rpc.ts";
-import { abortable, JetKvmError, clamp, redact, sdpCodec, sleep } from "./util.ts";
+import { abortable, JetKvmError, clamp, redact, sdpCodec } from "./util.ts";
 import { heldInputReleases } from "./input.ts";
 import {
   type DeviceConfig,
@@ -20,12 +20,30 @@ import {
 import {
   type CrossProcessClaim,
   acquireCrossProcessClaim,
+  crossProcessClaimIsCurrent,
   createDeviceLocks,
   peekCrossProcessClaim,
   type DeviceLocks,
 } from "./concurrency.ts";
-
 export type ConnectionState = "idle" | "connecting" | "connected";
+
+function waitFor(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.reject(new JetKvmError("Aborted", "connection attempt aborted"));
+  return new Promise<void>((resolve, reject) => {
+    const detach = (): void => signal.removeEventListener("abort", onAbort);
+    const timer = setTimeout(() => {
+      detach();
+      resolve();
+    }, ms);
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      detach();
+      reject(new JetKvmError("Aborted", "connection attempt aborted"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) onAbort();
+  });
+}
 
 export interface VideoState {
   ready?: boolean;
@@ -67,11 +85,21 @@ export class AuthState {
 
   private async performLogin(): Promise<void> {
     const password = this.ensurePassword();
-    const resp = await fetch(`${this.origin}/auth/login-local`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Connection: "close" },
-      body: JSON.stringify({ password: password ?? "" }),
-    });
+    const controller = new AbortController();
+    const deadline = setTimeout(() => controller.abort(), 10_000);
+    let resp: Response;
+    try {
+      resp = await fetch(`${this.origin}/auth/login-local`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Connection: "close" },
+        body: JSON.stringify({ password: password ?? "" }),
+        signal: controller.signal,
+      });
+    } catch (err) {
+      throw new JetKvmError("AuthError", `login request failed: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      clearTimeout(deadline);
+    }
     if (resp.status === 401) {
       throw new JetKvmError("AuthFailed", `login rejected for ${this.hostname} — check the configured password`);
     }
@@ -289,9 +317,11 @@ export class DeviceSession {
   private connectingDc: RTCDataChannel | null = null;
   private rpc: JsonRpcClient | null = null;
   private connectPromise: Promise<void> | null = null;
+  private connectController: AbortController | null = null;
   private keepaliveTimer: Timer | null = null;
   private claim: CrossProcessClaim | null = null;
   private backoffAttempt = 0;
+  private activeCalls = 0;
   /** Invalidates a connect that is superseded by teardown/reconnect. */
   private connectionGeneration = 0;
 
@@ -319,14 +349,15 @@ export class DeviceSession {
   }
 
   get claimInfo() {
-    return this.claim?.info ?? peekCrossProcessClaim(this.auth.hostname);
+    return peekCrossProcessClaim(this.auth.origin) ?? this.claim?.info ?? null;
   }
 
-  /** Tier-2 cross-process claim, acquired on first mutating call (DESIGN §3.4). */
+  /** Tier-2 cross-process claim, acquired/revalidated immediately before writes. */
   ensureClaim(force?: boolean): void {
-    if (this.claim) return;
     if (this.cfg.concurrency.crossProcess !== "lock") return;
-    this.claim = acquireCrossProcessClaim(this.auth.hostname, { enabled: true, force });
+    if (this.claim && crossProcessClaimIsCurrent(this.claim)) return;
+    this.claim?.release();
+    this.claim = acquireCrossProcessClaim(this.auth.origin, { enabled: true, force });
   }
 
   private startKeepalive(): void {
@@ -351,11 +382,11 @@ export class DeviceSession {
   private async tickHealth(keepaliveMs: number, idleTimeoutMs: number): Promise<void> {
     const now = Date.now();
     if (this.state !== "connected") return;
-    if (now - this.lastActivity > idleTimeoutMs) {
+    if (this.activeCalls === 0 && now - this.lastActivity > idleTimeoutMs) {
       await this.teardown("idle timeout");
       return;
     }
-    if (now - this.lastActivity > keepaliveMs) {
+    if (this.activeCalls === 0 && now - this.lastActivity > keepaliveMs) {
       try {
         await this.rpc?.call("ping", {}, { timeoutMs: Math.min(5_000, keepaliveMs) });
       } catch {
@@ -365,7 +396,6 @@ export class DeviceSession {
   }
 
   private handleEvent(event: RpcEvent): void {
-    this.lastActivity = Date.now();
     switch (event.method) {
       case "videoInputState":
         // Firmware sends complete snapshots; omitted fields clear old errors.
@@ -384,6 +414,7 @@ export class DeviceSession {
 
   private async teardown(reason: string): Promise<void> {
     this.connectionGeneration++;
+    this.connectController?.abort();
     this.state = "idle";
     this.connectedAt = 0;
     this.lastActivity = 0;
@@ -451,115 +482,127 @@ export class DeviceSession {
 
   private async connect(): Promise<void> {
     const generation = this.connectionGeneration;
-    // Capped exponential backoff between *automatic* reconnect attempts.
-    if (this.backoffAttempt > 0) {
-      await sleep(clamp(500 * 2 ** (this.backoffAttempt - 1), 500, 30_000));
-    }
-    if (generation !== this.connectionGeneration) {
-      throw new JetKvmError("ConnectionLost", "connection attempt superseded");
-    }
-    this.state = "connecting";
-    const pc = new RTCPeerConnection({ iceServers: [] });
-    const dc = pc.createDataChannel("rpc");
-    this.connectingPc = pc;
-    this.connectingDc = dc;
-    const opened = new Promise<void>((resolve, reject) => {
-      const t = setTimeout(
-        () => reject(new JetKvmError("ConnectionTimeout", "rpc datachannel did not open in 10s")),
-        10_000,
-      );
-      dc.onopen = () => {
-        clearTimeout(t);
-        resolve();
-      };
-      dc.onclose = () => {
-        clearTimeout(t);
-        reject(new JetKvmError("ConnectionLost", "rpc datachannel closed during connect"));
-      };
-    });
-    // A slow signaling request can let the open timeout reject before the
-    // code reaches `await opened`; attach a handler now to avoid an unhandled
-    // rejection while preserving the later await's error.
-    void opened.catch(() => {});
-    const rpc = new JsonRpcClient((text) => dc.send(text), this.cfg.session.rpcTimeoutMs);
-    dc.onMessage.subscribe((data) => {
-      this.lastActivity = Date.now();
-      rpc.handleMessage(data);
-    });
-    const unsubscribe = rpc.onEvent((event) => this.handleEvent(event));
+    const controller = new AbortController();
+    this.connectController = controller;
+    let timedOut = false;
+    const deadline = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, 30_000);
+    const signal = controller.signal;
+    let unsubscribe = (): void => {};
     let signaling: { close: () => void } | null = null;
-    let remoteDescriptionSet = false;
-    const pendingCandidates: unknown[] = [];
-    const onCandidate = async (candidate: unknown): Promise<void> => {
-      const value = candidate as { candidate?: string; sdpMid?: string | null; sdpMLineIndex?: number | null };
-      if (remoteDescriptionSet) await pc.addIceCandidate(value);
-      else pendingCandidates.push(value);
-    };
-    const addPendingCandidates = async (): Promise<void> => {
-      remoteDescriptionSet = true;
-      for (const candidate of pendingCandidates.splice(0)) {
-        await pc.addIceCandidate(candidate as { candidate?: string; sdpMid?: string | null; sdpMLineIndex?: number | null });
-      }
-    };
     try {
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      const t0 = Date.now();
-      while (pc.iceGatheringState !== "complete" && Date.now() - t0 < 5_000) {
-        await sleep(100);
+      if (this.backoffAttempt > 0) {
+        await waitFor(clamp(500 * 2 ** (this.backoffAttempt - 1), 500, 30_000), signal);
       }
-      const local = pc.localDescription ?? offer;
+      if (signal.aborted || generation !== this.connectionGeneration) {
+        throw new JetKvmError("ConnectionLost", "connection attempt superseded");
+      }
+      const attemptPeer: RTCPeerConnection = new RTCPeerConnection({ iceServers: [] });
+      this.connectingPc = attemptPeer;
+      const attemptChannel: RTCDataChannel = attemptPeer.createDataChannel("rpc");
+      this.connectingDc = attemptChannel;
+      const opened = new Promise<void>((resolve, reject) => {
+        const t = setTimeout(
+          () => fail(new JetKvmError("ConnectionTimeout", "rpc datachannel did not open in 10s")),
+          10_000,
+        );
+        const cleanup = (): void => {
+          clearTimeout(t);
+          signal.removeEventListener("abort", onAbort);
+        };
+        const fail = (error: Error): void => {
+          cleanup();
+          reject(error);
+        };
+        const onAbort = (): void => fail(new JetKvmError("Aborted", "connection attempt aborted"));
+        attemptChannel.onopen = () => {
+          cleanup();
+          resolve();
+        };
+        attemptChannel.onclose = () => fail(new JetKvmError("ConnectionLost", "rpc datachannel closed during connect"));
+        signal.addEventListener("abort", onAbort, { once: true });
+        if (signal.aborted) onAbort();
+      });
+      void opened.catch(() => {});
+      const attemptRpc = new JsonRpcClient((text) => attemptChannel.send(text), this.cfg.session.rpcTimeoutMs);
+      attemptChannel.onMessage.subscribe((data: string | Buffer) => attemptRpc.handleMessage(data));
+      unsubscribe = attemptRpc.onEvent((event) => this.handleEvent(event));
+      let remoteDescriptionSet = false;
+      const pendingCandidates: unknown[] = [];
+      const onCandidate = async (candidate: unknown): Promise<void> => {
+        if (signal.aborted) throw new JetKvmError("Aborted", "connection attempt aborted");
+        const value = candidate as { candidate?: string; sdpMid?: string | null; sdpMLineIndex?: number | null };
+        if (remoteDescriptionSet) await abortable(attemptPeer.addIceCandidate(value), signal, "connection attempt aborted");
+        else pendingCandidates.push(value);
+      };
+      const addPendingCandidates = async (): Promise<void> => {
+        remoteDescriptionSet = true;
+        for (const candidate of pendingCandidates.splice(0)) {
+          await abortable(
+            attemptPeer.addIceCandidate(candidate as { candidate?: string; sdpMid?: string | null; sdpMLineIndex?: number | null }),
+            signal,
+            "connection attempt aborted",
+          );
+        }
+      };
+      const offer = await abortable(attemptPeer.createOffer(), signal, "connection attempt aborted");
+      await abortable(attemptPeer.setLocalDescription(offer), signal, "connection attempt aborted");
+      const t0 = Date.now();
+      while (attemptPeer.iceGatheringState !== "complete" && Date.now() - t0 < 5_000) {
+        await waitFor(100, signal);
+      }
+      const local = attemptPeer.localDescription ?? offer;
       const resp = await this.auth.authedFetch("/webrtc/session", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ sd: sdpCodec.encode(local as { type: string; sdp: string }) }),
+        signal,
       });
       let answerB64: string;
       if (resp.status === 404) {
-        const exchange = await this.auth.websocketSignaling(sdpCodec.encode(local as { type: string; sdp: string }), onCandidate);
+        const exchange = await this.auth.websocketSignaling(sdpCodec.encode(local as { type: string; sdp: string }), onCandidate, signal);
         signaling = exchange;
         answerB64 = exchange.answer;
       } else {
-        if (!resp.ok) {
-          throw new JetKvmError("SignalingFailed", `POST /webrtc/session -> HTTP ${resp.status}`);
+        if (!resp.ok) throw new JetKvmError("SignalingFailed", `POST /webrtc/session -> HTTP ${resp.status}`);
+        const body: unknown = await resp.json();
+        if (typeof body !== "object" || body === null || !("sd" in body) || typeof body.sd !== "string") {
+          throw new JetKvmError("SignalingFailed", "signaling response did not contain an SDP answer");
         }
-        const body = (await resp.json()) as { sd: string };
         answerB64 = body.sd;
       }
       const answer = sdpCodec.decode(answerB64);
-      await pc.setRemoteDescription({ type: "answer", sdp: answer.sdp });
+      await abortable(attemptPeer.setRemoteDescription({ type: "answer", sdp: answer.sdp }), signal, "connection attempt aborted");
       await addPendingCandidates();
-      await opened;
-      await rpc.call("ping", {}, { timeoutMs: 5_000 });
+      await abortable(opened, signal, "connection attempt aborted");
+      await attemptRpc.call("ping", {}, { timeoutMs: 5_000, signal });
       signaling?.close();
       signaling = null;
-      // A user-ordered reconnect/dispose may have torn down this in-flight
-      // peer while signaling or pinging. Never publish that stale channel.
-      if (generation !== this.connectionGeneration) {
+      if (signal.aborted || generation !== this.connectionGeneration) {
         throw new JetKvmError("ConnectionLost", "connection attempt superseded");
       }
-      this.pc = pc;
-      this.dc = dc;
+      this.pc = attemptPeer;
+      this.dc = attemptChannel;
       this.connectingPc = null;
       this.connectingDc = null;
-      this.rpc = rpc;
+      this.rpc = attemptRpc;
       this.state = "connected";
       this.connectedAt = Date.now();
       this.lastActivity = Date.now();
       this.backoffAttempt = 0;
       this.lastError = null;
       this.startKeepalive();
-
-      // Prime the video coordinate space; events keep it fresh afterwards.
       try {
-        const vs = (await rpc.call("getVideoState")) as VideoState;
-        this.videoState = vs;
-      } catch {
-        // device may lack it; videoInputState events still update us
+        const vs = (await attemptRpc.call("getVideoState", {}, { signal })) as VideoState;
+        if (generation === this.connectionGeneration) this.videoState = vs;
+      } catch (err) {
+        if (signal.aborted) throw err;
+        // Device may lack it; videoInputState events still update the snapshot.
       }
-      // Track dc close after successful connect.
-      dc.onclose = () => {
-        if (this.state === "connected") {
+      attemptChannel.onclose = () => {
+        if (this.state === "connected" && this.pc === attemptPeer) {
           this.backoffAttempt = 1;
           this.lastError = "datachannel closed";
           void this.teardown("datachannel closed");
@@ -567,27 +610,38 @@ export class DeviceSession {
       };
     } catch (err) {
       signaling?.close();
-      signaling = null;
       unsubscribe();
-      if (this.connectingPc === pc) this.connectingPc = null;
-      if (this.connectingDc === dc) this.connectingDc = null;
-      try {
-        dc.close();
-      } catch {
-        // ignore
+      if (generation === this.connectionGeneration) {
+        try {
+          (this.connectingDc ?? this.dc)?.close();
+        } catch {
+          // ignore
+        }
+        try {
+          (this.connectingPc ?? this.pc)?.close();
+        } catch {
+          // ignore
+        }
+        this.rpc?.close("connect failed");
+        this.connectingPc = null;
+        this.connectingDc = null;
+        this.state = "idle";
+        this.connectedAt = 0;
+        this.lastActivity = 0;
+        this.rpc = null;
+        this.pc = null;
+        this.dc = null;
+        this.stopKeepalive();
+        this.backoffAttempt = Math.min(this.backoffAttempt + 1, 7);
+        this.lastError = redact(String(err), this.dev.password);
       }
-      try {
-        pc.close();
-      } catch {
-        // ignore
-      }
-      rpc.close("connect failed");
-      this.state = "idle";
-      this.backoffAttempt = Math.min(this.backoffAttempt + 1, 7);
-      this.lastError = redact(String(err), this.dev.password);
+      if (timedOut) throw new JetKvmError("ConnectionTimeout", "connection attempt exceeded its 30s deadline");
       throw err instanceof JetKvmError
         ? err
         : new JetKvmError("ConnectionFailed", redact(String(err), this.dev.password));
+    } finally {
+      clearTimeout(deadline);
+      if (this.connectController === controller) this.connectController = null;
     }
   }
 
@@ -596,17 +650,38 @@ export class DeviceSession {
    * retryOnReconnect — replaying HID events is worse than failing.
    */
   async call(method: string, params: Record<string, unknown> = {}, opts: SessionCallOptions = {}): Promise<unknown> {
-    let client = await this.ensureConnected(opts.signal);
+    this.lastActivity = Date.now();
+    this.activeCalls++;
     try {
-      return await client.call(method, params, { timeoutMs: opts.timeoutMs, signal: opts.signal });
-    } catch (err) {
-      if (!(err instanceof JetKvmError)) throw err;
-      if (!opts.retryOnReconnect) throw err;
-      if (err.code !== "ConnectionLost" && err.code !== "RpcTimeout") throw err;
-      await this.teardown(`reconnect after ${err.code}`);
-      this.backoffAttempt = 0;
-      client = await this.ensureConnected(opts.signal);
-      return client.call(method, params, { timeoutMs: opts.timeoutMs, signal: opts.signal });
+      let client = await this.ensureConnected(opts.signal);
+      const mutating = [
+        "keyboardReport",
+        "absMouseReport",
+        "wheelReport",
+        "unmountImage",
+        "mountWithHTTP",
+        "mountWithStorage",
+        "deleteStorageFile",
+        "setATXPowerAction",
+        "sendWOLMagicPacket",
+        "wakeHost",
+        "setUsbEmulationState",
+        "setKeyboardLayout",
+      ].includes(method);
+      if (mutating) this.ensureClaim();
+      try {
+        return await client.call(method, params, { timeoutMs: opts.timeoutMs, signal: opts.signal });
+      } catch (err) {
+        if (!(err instanceof JetKvmError)) throw err;
+        if (!opts.retryOnReconnect || mutating) throw err;
+        if (err.code !== "ConnectionLost" && err.code !== "RpcTimeout") throw err;
+        await this.teardown(`reconnect after ${err.code}`);
+        this.backoffAttempt = 0;
+        client = await this.ensureConnected(opts.signal);
+        return client.call(method, params, { timeoutMs: opts.timeoutMs, signal: opts.signal });
+      }
+    } finally {
+      this.activeCalls--;
     }
   }
 

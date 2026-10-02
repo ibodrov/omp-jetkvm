@@ -1,4 +1,5 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, vi } from "bun:test";
+import { acquireCrossProcessClaim, type CrossProcessClaim } from "../src/concurrency.ts";
 import { FakeDevice } from "./helpers/fake-device.ts";
 import { JsonRpcClient } from "../src/rpc.ts";
 import { RTCPeerConnection } from "werift";
@@ -124,6 +125,126 @@ describe("fake device harness", () => {
       expect(await session.videoDims()).toEqual({ width: 1920, height: 1080 });
       expect(logins).toBe(2);
     } finally {
+      await session.dispose();
+      await device.close();
+      server.stop(true);
+    }
+  }, 20_000);
+
+  test("dispose aborts gated login and signaling before their HTTP responses", async () => {
+    for (const blockedPath of ["/auth/login-local", "/webrtc/session"]) {
+      let release!: () => void;
+      let started!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const reachedGate = new Promise<void>((resolve) => {
+        started = resolve;
+      });
+      const server = Bun.serve({
+        hostname: "127.0.0.1",
+        port: 0,
+        async fetch(request) {
+          const path = new URL(request.url).pathname;
+          if (path === blockedPath) {
+            started();
+            await gate;
+            if (path === "/auth/login-local") {
+              return new Response("ok", { headers: { "Set-Cookie": "authToken=gate; Path=/" } });
+            }
+            return Response.json({ sd: "unused" });
+          }
+          if (path === "/auth/login-local") {
+            return new Response("ok", { headers: { "Set-Cookie": "authToken=gate; Path=/" } });
+          }
+          return new Response("not found", { status: 404 });
+        },
+      });
+      const session = new DeviceSession("cancel-gate", {
+        host: `127.0.0.1:${server.port}`,
+        password: "test-password",
+      }, structuredClone(JETKVM_CONFIG_DEFAULTS));
+      const pending = session.ensureConnected().catch(() => null);
+      try {
+        await reachedGate;
+        await session.dispose();
+        expect(session.rpcClient).toBeNull();
+        release();
+        await pending;
+      } finally {
+        release();
+        await session.dispose();
+        server.stop(true);
+      }
+    }
+  }, 20_000);
+
+  test("healthy keepalive traffic does not refresh caller idle activity", async () => {
+    vi.useFakeTimers();
+    const config = structuredClone(JETKVM_CONFIG_DEFAULTS);
+    config.session.keepaliveMs = 10;
+    config.session.idleTimeoutMs = 30;
+    const session = new DeviceSession("idle-test", { host: "idle-test.local" }, config);
+    const keepaliveControl = session as unknown as { startKeepalive(): void };
+    try {
+      session.ensureClaim();
+      session.state = "connected";
+      session.lastActivity = Date.now();
+      keepaliveControl.startKeepalive();
+      vi.advanceTimersByTime(40);
+      expect(String(session.state)).toBe("idle");
+      expect(session.claimInfo).toBeNull();
+    } finally {
+      await session.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  test("a retried read cannot leave a mutation without a fresh claim", async () => {
+    const device = new FakeDevice();
+    let token = "";
+    let loginCount = 0;
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      async fetch(request) {
+        const path = new URL(request.url).pathname;
+        if (path === "/auth/login-local") {
+          token = `token-${++loginCount}`;
+          return new Response("ok", { headers: { "Set-Cookie": `authToken=${token}; Path=/` } });
+        }
+        if (request.headers.get("cookie") !== `authToken=${token}`) {
+          return new Response("unauthorized", { status: 401 });
+        }
+        if (path === "/webrtc/session") {
+          const payload: unknown = await request.json();
+          if (typeof payload !== "object" || payload === null || !("sd" in payload) || typeof payload.sd !== "string") {
+            return new Response("bad offer", { status: 400 });
+          }
+          return Response.json({ sd: await device.handleSignaling(payload.sd) });
+        }
+        return new Response("not found", { status: 404 });
+      },
+    });
+    const host = `127.0.0.1:${server.port}`;
+    const config = structuredClone(JETKVM_CONFIG_DEFAULTS);
+    config.session.rpcTimeoutMs = 50;
+    const session = new DeviceSession("retry-claim", { host }, config);
+    let competitor: CrossProcessClaim | null = null;
+    try {
+      expect(await session.call("ping")).toBe("pong");
+      device.dropNextResponse("getVideoState");
+      expect(await session.call("getVideoState", {}, { retryOnReconnect: true })).toMatchObject({
+        width: 1920,
+        height: 1080,
+      });
+      competitor = acquireCrossProcessClaim(`http://${host}`, { enabled: true });
+      await expect(session.call("keyboardReport", { modifier: 0, keys: [] })).rejects.toMatchObject({
+        code: "DeviceBusy",
+      });
+      expect(device.inputs.some((input) => input.method === "keyboardReport")).toBe(false);
+    } finally {
+      competitor?.release();
       await session.dispose();
       await device.close();
       server.stop(true);

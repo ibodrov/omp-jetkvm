@@ -44,7 +44,12 @@ export const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
 /** Await an operation without retaining abort listeners on long-lived signals. */
 export function abortable<T>(operation: Promise<T>, signal: AbortSignal | undefined, message: string): Promise<T> {
   if (!signal) return operation;
-  if (signal.aborted) return Promise.reject(new JetKvmError("Aborted", message));
+  if (signal.aborted) {
+    // The supplied operation has already started; observe a late rejection
+    // even though this caller no longer waits for it.
+    void operation.catch(() => {});
+    return Promise.reject(new JetKvmError("Aborted", message));
+  }
   return new Promise<T>((resolve, reject) => {
     const detach = (): void => signal.removeEventListener("abort", onAbort);
     const onAbort = (): void => {

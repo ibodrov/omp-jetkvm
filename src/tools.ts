@@ -2,7 +2,6 @@
  * Tool surface: jetkvm_screenshot / _mouse / _keyboard / _storage / _device.
  * DESIGN §4. Registered from index.ts with pi.zod schemas.
  */
-import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { abortable, JetKvmError, humanBytes, pixelToHid } from "./util.ts";
@@ -226,7 +225,6 @@ export function buildScreenshotTool(cfg: JetKvmConfig, z: ZodLike): ToolDefiniti
         onUpdate?.({ content: [text(`capturing via ${engine.name} engine...`)] });
         const cap = await engine.capture({ format, quality, maxModelWidth, signal });
         const dir = screenshotDir(cfg);
-        mkdirSync(dir, { recursive: true });
         const path = writeScreenshotFile(cap.fullData, cap.fullMime, dir);
         const bytes = Math.round((cap.fullData.length * 3) / 4);
         const dims = { width: cap.width, height: cap.height };
@@ -265,7 +263,7 @@ export function buildMouseTool(cfg: JetKvmConfig, z: ZodLike): ToolDefinitionLik
     name: "jetkvm_mouse",
     label: "JetKVM mouse",
     description:
-      "Mouse input on the remote host. Coordinates are stream pixels — the same space as the screenshot (details.coordinateSpace). Actions: move, click (left/middle/right, modifiers, double via double_click), right_click, drag (x1,y1 -> x2,y2), scroll (dy notches, +up/-down), down/up. down holds the button (like keyboard down) until up / release_all — releases ALL held input; up's x/y are optional and default to the last pointer position.",
+      "Mouse input on the remote host. Coordinates use full-resolution stream pixels (details.coordinateSpace), not pixels in a downscaled inline preview. Actions: move, click (left/middle/right, modifiers, double via double_click), right_click, drag (x1,y1 -> x2,y2), scroll (dy notches, +up/-down), down/up. down holds the button until up / release_all — releases ALL held input; up's x/y are optional and default to the last pointer position, including when video is unavailable.",
     approval: "write",
     loadMode: "discoverable",
     parameters: z.object({
@@ -303,10 +301,10 @@ export function buildMouseTool(cfg: JetKvmConfig, z: ZodLike): ToolDefinitionLik
           const release = await session.locks.input.acquire(holder, signal);
           let attemptedHold: { x: number; y: number } | null = null;
           try {
-            // Claim inside the try: an InputBusy timeout must not leave a
-            // cross-process claim behind for a hold that never happened.
-            session.ensureClaim(params["force"] as boolean | undefined);
             const dims = await session.videoDims(signal);
+            // Dimension recovery may replace the connection and release its
+            // claim. Take ownership only after that preflight completes.
+            session.ensureClaim(params["force"] as boolean | undefined);
             const button = (params["button"] as keyof typeof MOUSE_BUTTONS) ?? "left";
             const hx = pixelToHid(x, dims.width);
             const hy = pixelToHid(y, dims.height);
@@ -322,12 +320,16 @@ export function buildMouseTool(cfg: JetKvmConfig, z: ZodLike): ToolDefinitionLik
               content: [text(`holding ${button} button at ${x},${y} — release with action up / release_all`)],
               details: { button, device: session.name },
             };
-          } catch (e) {
-            if (attemptedHold) {
-              await session.call("absMouseReport", { ...attemptedHold, buttons: 0 }).catch(() => {});
+          } catch (error) {
+            try {
+              if (attemptedHold) await releaseAllInput(session, attemptedHold);
+            } catch (releaseError) {
+              if (releaseError instanceof Error) releaseError.cause = error;
+              return err(releaseError);
+            } finally {
+              release();
             }
-            release();
-            return err(e);
+            return err(error);
           }
         }
 
@@ -336,12 +338,22 @@ export function buildMouseTool(cfg: JetKvmConfig, z: ZodLike): ToolDefinitionLik
         // held input; the mouse report goes to x,y when given, else the last
         // known pointer position (never a corner teleport).
         if (action === "up") {
-          const at =
-            x !== undefined && y !== undefined
-              ? await session.videoDims().then((dims) => ({ x: pixelToHid(x, dims.width), y: pixelToHid(y, dims.height) }))
-              : undefined;
+          let at: { x: number; y: number } | undefined;
+          const warnings: string[] = [];
+          if (x !== undefined && y !== undefined) {
+            try {
+              const dims = await session.videoDims();
+              at = { x: pixelToHid(x, dims.width), y: pixelToHid(y, dims.height) };
+            } catch (error) {
+              const code = error instanceof JetKvmError ? error.code : "UnexpectedError";
+              warnings.push(`release positioning unavailable (${code}); used the last known pointer position`);
+            }
+          }
           await releaseAllInput(session, at);
-          return { content: [text("released all held input (keys and buttons)")], details: { device: session.name } };
+          return {
+            content: [text(`released all held input (keys and buttons)${warnings.length ? ` (${warnings.join("; ")})` : ""}`)],
+            details: { device: session.name, warnings },
+          };
         }
 
         const { result, warnings } = await runInputTransaction(
@@ -455,12 +467,16 @@ export function buildKeyboardTool(cfg: JetKvmConfig, z: ZodLike): ToolDefinition
               content: [text(`holding "${params["keys"]}" — release with action up / release_all`)],
               details: { held: params["keys"], device: session.name },
             };
-          } catch (e) {
-            if (mayBeHeld) {
-              await session.call("keyboardReport", { modifier: 0, keys: hidKeysPayload([]) }).catch(() => {});
+          } catch (error) {
+            try {
+              if (mayBeHeld) await releaseAllInput(session);
+            } catch (releaseError) {
+              if (releaseError instanceof Error) releaseError.cause = error;
+              return err(releaseError);
+            } finally {
+              release();
             }
-            release();
-            return err(e);
+            return err(error);
           }
         }
 
@@ -582,20 +598,20 @@ export function buildStorageTool(cfg: JetKvmConfig, z: ZodLike): ToolDefinitionL
             case "delete_file": {
               const filename = String(params["filename"] ?? "");
               if (!filename) throw new JetKvmError("BadParams", "delete_file needs filename");
-              const r = await deleteFile(session, filename);
+              const r = await deleteFile(session, filename, signal);
               return { content: [text(`deleted ${filename}`)], details: r };
             }
             case "mount_url": {
               const url = String(params["url"] ?? "");
               if (!url) throw new JetKvmError("BadParams", "mount_url needs url");
               const r = await mountUrl(session, cfg.policy, { url, mode, signal });
-              return { content: [text(`mounted ${url} (${mode ?? "CDROM"})`)], details: { ...r, state: await getMountState(session) } };
+              return { content: [text(`mounted ${url} (${mode ?? "CDROM"})`)], details: { ...r, state: await getMountState(session, signal) } };
             }
             case "serve_and_mount": {
               const path = String(params["path"] ?? "");
               if (!path) throw new JetKvmError("BadParams", "serve_and_mount needs path");
               const r = await serveAndMount(session, cfg.policy, { path, mode, signal });
-              return { content: [text(`serving ${r["serving"]} and mounted (${mode ?? "CDROM"})`)], details: { ...r, state: await getMountState(session) } };
+              return { content: [text(`serving ${r["serving"]} and mounted (${mode ?? "CDROM"})`)], details: { ...r, state: await getMountState(session, signal) } };
             }
             case "upload": {
               const path = String(params["path"] ?? "");
@@ -619,17 +635,17 @@ export function buildStorageTool(cfg: JetKvmConfig, z: ZodLike): ToolDefinitionL
                 signal,
                 onProgress: (p) => onUpdate?.({ content: [text(`uploading: ${humanBytes(p.bytesSent)} / ${humanBytes(p.totalBytes)}`)] }),
               });
-              const mounted = await mountFile(session, cfg.policy, { filename: up.filename, mode });
+              const mounted = await mountFile(session, cfg.policy, { filename: up.filename, mode, signal });
               return { content: [text(`uploaded and mounted ${up.filename} (${mode ?? "CDROM"})`)], details: { ...up, mounted } };
             }
             case "mount_file": {
               const filename = String(params["filename"] ?? "");
               if (!filename) throw new JetKvmError("BadParams", "mount_file needs filename");
-              const mounted = await mountFile(session, cfg.policy, { filename, mode });
+              const mounted = await mountFile(session, cfg.policy, { filename, mode, signal });
               return { content: [text(`mounted ${filename} (${mode ?? "CDROM"})`)], details: { mounted } };
             }
             case "unmount": {
-              const r = await unmount(session);
+              const r = await unmount(session, signal);
               return { content: [text("unmounted")], details: r };
             }
             default:

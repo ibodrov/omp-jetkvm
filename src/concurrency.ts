@@ -9,6 +9,7 @@
  * Tier 3 (cross-machine) is detection-only; see input.ts / status reporting.
  */
 import { mkdirSync, writeFileSync, unlinkSync, existsSync, readFileSync, openSync, closeSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
 import os from "node:os";
 import { JetKvmError } from "./util.ts";
 
@@ -124,8 +125,15 @@ export function createDeviceLocks(queueTimeoutMs: number): DeviceLocks {
 export interface ClaimInfo {
   pid: number;
   since: number;
+  origin: string;
+  owner: string;
   /** Process start time (Linux /proc stat field 22) — defeats pid reuse. */
   startTicks?: number | null;
+}
+/** Whether this handle still owns the portable publication. */
+export function crossProcessClaimIsCurrent(claim: CrossProcessClaim): boolean {
+  if (process.platform === "linux") return true;
+  return readInfo(claim.info.origin)?.owner === claim.info.owner;
 }
 
 export interface CrossProcessClaim {
@@ -150,10 +158,15 @@ function pidStartTicks(pid: number): number | null {
  * Holder liveness: pid alive AND (when recorded) the same process instance.
  * Without startTicks, a recycled pid masquerades as the holder forever.
  */
-export function holderIsLive(info: ClaimInfo): boolean {
+export function holderIsLive(info: Pick<ClaimInfo, "pid" | "since" | "startTicks">): boolean {
   if (!pidAlive(info.pid)) return false;
   if (info.startTicks === undefined || info.startTicks === null) return true;
   return pidStartTicks(info.pid) === info.startTicks;
+}
+
+function normalizedOrigin(value: string): string {
+  const origin = value.includes("://") ? value : `http://${value}`;
+  return new URL(origin).origin.toLowerCase();
 }
 
 function claimDir(): string {
@@ -162,17 +175,25 @@ function claimDir(): string {
   return dir;
 }
 
-function infoFilePath(hostname: string): string {
-  // Hostnames can contain chars we don't want in filenames (mDNS dots are fine).
-  const safe = hostname.replace(/[^a-zA-Z0-9._-]/g, "_");
-  return `${claimDir()}/${safe}.json`;
+function infoFilePath(origin: string): string {
+  const key = createHash("sha256").update(normalizedOrigin(origin)).digest("hex");
+  return `${claimDir()}/${key}.json`;
 }
 
-function readInfo(hostname: string): ClaimInfo | null {
+function readInfo(origin: string): ClaimInfo | null {
   try {
-    const path = infoFilePath(hostname);
+    const path = infoFilePath(origin);
     if (!existsSync(path)) return null;
-    return JSON.parse(readFileSync(path, "utf8")) as ClaimInfo;
+    const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+    if (typeof parsed !== "object" || parsed === null ||
+      !("pid" in parsed) || typeof parsed.pid !== "number" ||
+      !("since" in parsed) || typeof parsed.since !== "number" ||
+      !("origin" in parsed) || typeof parsed.origin !== "string" ||
+      !("owner" in parsed) || typeof parsed.owner !== "string" ||
+      ("startTicks" in parsed && parsed.startTicks !== null && typeof parsed.startTicks !== "number")) return null;
+    if (parsed.origin !== normalizedOrigin(origin)) return null;
+    const info = parsed as ClaimInfo;
+    return info;
   } catch {
     return null;
   }
@@ -192,15 +213,22 @@ function pidAlive(pid: number): boolean {
  * `force` steals an existing claim whose owning pid is alive (user-ordered override).
  * Throws DeviceBusy when someone else holds a live claim.
  */
-export function acquireCrossProcessClaim(hostname: string, opts: { enabled: boolean; force?: boolean }): CrossProcessClaim {
-  const info: ClaimInfo = { pid: process.pid, since: Date.now(), startTicks: pidStartTicks(process.pid) };
+export function acquireCrossProcessClaim(origin: string, opts: { enabled: boolean; force?: boolean }): CrossProcessClaim {
+  const normalized = normalizedOrigin(origin);
+  const info: ClaimInfo = {
+    pid: process.pid,
+    since: Date.now(),
+    origin: normalized,
+    owner: randomUUID(),
+    startTicks: pidStartTicks(process.pid),
+  };
   if (!opts.enabled) {
     return { info, release() {} };
   }
 
-  const path = infoFilePath(hostname);
+  const path = infoFilePath(normalized);
   if (process.platform === "linux") {
-    const abstractName = `\0omp-jetkvm:${hostname}`;
+    const abstractName = `\0omp-jetkvm:${createHash("sha256").update(normalized).digest("hex")}`;
     let listener: { stop(closeActiveConnections?: boolean): void };
     try {
       // Bun.listen binds synchronously. node:net.Server.listen reports
@@ -216,19 +244,24 @@ export function acquireCrossProcessClaim(hostname: string, opts: { enabled: bool
         },
       });
     } catch (err) {
-      const existing = readInfo(hostname);
+      const existing = readInfo(normalized);
+      // An unreadable/partially published sidecar is not proof of a dead
+      // owner. The kernel socket remains authoritative for exclusivity.
       const holder = existing && holderIsLive(existing) ? existing : null;
       if (holder && !opts.force) {
-        throw new JetKvmError("DeviceBusy", `device ${hostname} input is claimed by omp pid ${holder.pid} since ${new Date(holder.since).toISOString()} — retry with force: true to steal, or set jetkvm.concurrency.crossProcess: none`, {
+        throw new JetKvmError("DeviceBusy", `device ${normalized} input is claimed by omp pid ${holder.pid} since ${new Date(holder.since).toISOString()} — retry with force: true to steal, or set jetkvm.concurrency.crossProcess: none`, {
           holderPid: holder.pid,
           since: holder.since,
         });
       }
-      if (holder) {
-        throw new JetKvmError("DeviceBusy", `cannot force-steal a live cross-process claim (pid ${holder.pid} holds the kernel socket); stop that process or set crossProcess: none`, { holderPid: holder.pid });
+      if (!existing || holder) {
+        throw new JetKvmError("DeviceBusy", `device ${normalized} is claimed by another process on this machine (no safely stealable claim record)`, {
+          origin: normalized,
+          cause: err instanceof Error ? err.message : String(err),
+        });
       }
-      throw new JetKvmError("DeviceBusy", `device ${hostname} is claimed by another process on this machine (no live claim record; pid unknown)`, {
-        hostname,
+      throw new JetKvmError("DeviceBusy", `device ${normalized} is claimed by another process on this machine (no live claim record; pid unknown)`, {
+        origin: normalized,
         cause: err instanceof Error ? err.message : String(err),
       });
     }
@@ -244,28 +277,33 @@ export function acquireCrossProcessClaim(hostname: string, opts: { enabled: bool
       release() {
         if (released) return;
         released = true;
-        // Remove the sidecar while the kernel socket is still held. Stopping
-        // first lets a new owner create its sidecar before this owner unlinks
-        // it, erasing the new holder's diagnostics.
+        // Only the exact sidecar publication made by this owner can be removed.
         try {
-          unlinkSync(path);
+          const current = readInfo(normalized);
+          if (current?.owner === info.owner) unlinkSync(path);
         } catch {
-          // already gone
+          // A replaced publication belongs to the replacement owner.
         }
         listener.stop(true);
       },
     };
   }
 
-  // Non-Linux: O_EXCL lockfile + pid liveness.
+  // Non-Linux: O_EXCL lockfile + pid liveness. The exclusive create reserves
+  // ownership before publication; partial files are always treated as busy.
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const fd = openSync(path, "wx");
-      writeFileSync(fd, JSON.stringify(info));
-      closeSync(fd);
+      try {
+        writeFileSync(fd, JSON.stringify(info));
+      } finally {
+        closeSync(fd);
+      }
       return {
         info,
         release() {
+          const current = readInfo(normalized);
+          if (current?.owner !== info.owner) return;
           try {
             unlinkSync(path);
           } catch {
@@ -275,13 +313,16 @@ export function acquireCrossProcessClaim(hostname: string, opts: { enabled: bool
       };
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-      const existing = readInfo(hostname);
+      const existing = readInfo(normalized);
       const holder = existing && holderIsLive(existing) ? existing : null;
       if (holder && !opts.force) {
-        throw new JetKvmError("DeviceBusy", `device ${hostname} input is claimed by omp pid ${holder.pid} since ${new Date(holder.since).toISOString()} — retry with force: true to steal`, {
+        throw new JetKvmError("DeviceBusy", `device ${normalized} input is claimed by omp pid ${holder.pid} since ${new Date(holder.since).toISOString()} — retry with force: true to steal`, {
           holderPid: holder.pid,
           since: holder.since,
         });
+      }
+      if (!existing) {
+        throw new JetKvmError("DeviceBusy", `device ${normalized} has an incomplete claim publication`, { origin: normalized });
       }
       try {
         unlinkSync(path);
@@ -290,11 +331,11 @@ export function acquireCrossProcessClaim(hostname: string, opts: { enabled: bool
       }
     }
   }
-  throw new JetKvmError("DeviceBusy", `could not acquire cross-process claim for ${hostname}`, { hostname });
+  throw new JetKvmError("DeviceBusy", `could not acquire cross-process claim for ${normalized}`, { origin: normalized });
 }
 
 /** Read-only peek at the current claim, if any (for the /jetkvm status card). */
-export function peekCrossProcessClaim(hostname: string): ClaimInfo | null {
-  const info = readInfo(hostname);
+export function peekCrossProcessClaim(origin: string): ClaimInfo | null {
+  const info = readInfo(origin);
   return info && holderIsLive(info) ? info : null;
 }

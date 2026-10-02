@@ -1,3 +1,7 @@
+import { createHash, randomUUID } from "node:crypto";
+import { readFileSync, unlinkSync } from "node:fs";
+import os from "node:os";
+import { join } from "node:path";
 import { acquireCrossProcessClaim, AsyncMutex, holderIsLive, peekCrossProcessClaim } from "../src/concurrency.ts";
 import { JetKvmError } from "../src/util.ts";
 import { describe, expect, test } from "bun:test";
@@ -209,6 +213,43 @@ describe("cross-process claim liveness (pid reuse)", () => {
       ).toThrow(/claimed/);
     } finally {
       first.release();
+    }
+  });
+  test("origin aliases share one cross-process ownership key", () => {
+    const name = `claim-origin-${randomUUID()}.local`;
+    const claim = acquireCrossProcessClaim(name, { enabled: true });
+    try {
+      expect(() => acquireCrossProcessClaim(`http://${name}`, { enabled: true })).toThrow(/claimed/);
+      expect(claim.info.origin).toBe(`http://${name}`);
+    } finally {
+      claim.release();
+    }
+  });
+
+  test("an old owner release does not unlink a replacement publication", () => {
+    const origin = `http://claim-replaced-${randomUUID()}.local`;
+    const claim = acquireCrossProcessClaim(origin, { enabled: true });
+    const path = join(
+      os.homedir(),
+      ".cache/omp-jetkvm",
+      `${createHash("sha256").update(origin).digest("hex")}.json`,
+    );
+    const replacement = {
+      ...claim.info,
+      owner: randomUUID(),
+      since: claim.info.since + 1,
+    };
+    try {
+      writeFileSync(path, JSON.stringify(replacement));
+      claim.release();
+      expect(peekCrossProcessClaim(origin)?.owner).toBe(replacement.owner);
+    } finally {
+      try {
+        const current = JSON.parse(readFileSync(path, "utf8")) as { owner?: string };
+        if (current.owner === replacement.owner) unlinkSync(path);
+      } catch {
+        // The claim may already be absent.
+      }
     }
   });
 

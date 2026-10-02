@@ -55,6 +55,7 @@ export class BrowserEngine implements ScreenshotEngine {
   private idleTimer: Timer | undefined;
   private connecting: Promise<void> | null = null;
   private lastCaptureAt = 0;
+  private disposed = false;
   private readonly auth: AuthState;
 
   constructor(
@@ -102,18 +103,16 @@ export class BrowserEngine implements ScreenshotEngine {
    * browser announces `DevTools listening on ws://...` on stderr with
    * --remote-debugging-port=0; we parse and connect.
    */
-  private ensurePage(): Promise<Page> {
-    if (this.page && this.browser) return Promise.resolve(this.page);
+  private async ensurePage(): Promise<Page> {
+    if (this.disposed) throw new JetKvmError("Aborted", "screenshot engine disposed");
+    if (this.page && this.browser && !this.page.isClosed()) return this.page;
     if (this.pagePromise) return this.pagePromise;
+    if (this.page || this.browser) await this.closePage();
     const pending = this.launchPage();
     this.pagePromise = pending;
     pending.then(
-      () => {
-        if (this.pagePromise === pending) this.pagePromise = null;
-      },
-      () => {
-        if (this.pagePromise === pending) this.pagePromise = null;
-      },
+      () => { if (this.pagePromise === pending) this.pagePromise = null; },
+      () => { if (this.pagePromise === pending) this.pagePromise = null; },
     );
     return pending;
   }
@@ -152,24 +151,45 @@ export class BrowserEngine implements ScreenshotEngine {
       const m = /DevTools listening on (ws:\/\/\S+)/.exec(stderrTail);
       if (m) settle(m[1]!);
     });
+    child.once("error", (err) => settle(new JetKvmError(
+      "ChromiumLaunchFailed",
+      `failed to start Chromium (${(err as NodeJS.ErrnoException).code ?? "unknown"})`,
+    )));
     child.once("exit", (code) => {
       settle(new JetKvmError("ChromiumLaunchFailed", `chromium exited early (code ${String(code)}): ${stderrTail.slice(-300)}`));
     });
     try {
       const endpoint = await promise;
       if (endpoint instanceof Error) throw endpoint;
-      this.browser = await puppeteer.connect({ browserWSEndpoint: endpoint, defaultViewport: null });
-      this.page = await this.browser.newPage();
-      await this.page.setDefaultTimeout(30_000);
-      await this.page.goto(this.bridgeUrl(), { waitUntil: "domcontentloaded" });
-      return this.page;
+      if (this.disposed) throw new JetKvmError("Aborted", "screenshot engine disposed");
+      const browser = await puppeteer.connect({ browserWSEndpoint: endpoint, defaultViewport: null });
+      if (this.disposed) {
+        await browser.close();
+        throw new JetKvmError("Aborted", "screenshot engine disposed");
+      }
+      this.browser = browser;
+      const page = await browser.newPage();
+      if (this.disposed) {
+        await browser.close();
+        throw new JetKvmError("Aborted", "screenshot engine disposed");
+      }
+      this.page = page;
+      await page.setDefaultTimeout(30_000);
+      await page.goto(this.bridgeUrl(), { waitUntil: "domcontentloaded" });
+      if (this.disposed) throw new JetKvmError("Aborted", "screenshot engine disposed");
+      return page;
     } catch (err) {
       try {
         child.kill("SIGKILL");
       } catch {
         // already gone
       }
-      rmSync(userDir, { recursive: true, force: true });
+      await this.closePage();
+      try {
+        rmSync(userDir, { recursive: true, force: true });
+      } catch {
+        // best effort
+      }
       throw err;
     }
   }
@@ -213,11 +233,8 @@ export class BrowserEngine implements ScreenshotEngine {
   private async ensureConnected(): Promise<Page> {
     const page = await this.ensurePage();
     if (!this.connecting) {
-      // JetKVM can stop updating an existing peer after another control
-      // session connects. Even a recently decoded frame may predate input.
-      // Keep Chromium warm, but reset the document/decoder and negotiate a
-      // fresh peer for each capture rather than returning cached pixels.
       const pending = (async () => {
+        if (page.isClosed()) throw new JetKvmError("ChromiumPageClosed", "Chromium page closed");
         await page.reload({ waitUntil: "domcontentloaded" });
         await this.connectBridge(page);
       })().catch(async (err) => {
@@ -254,25 +271,16 @@ export class BrowserEngine implements ScreenshotEngine {
   }
 
   async capture(opts: CaptureOptions): Promise<CaptureResult> {
+    if (this.disposed || opts.signal?.aborted) throw new JetKvmError("Aborted", "screenshot capture aborted");
     this.armIdleKill();
-    // A fresh document/peer guarantees the capture follows preceding input.
-    const page = await abortable(
-      this.ensureConnected(),
-      opts.signal,
-      "screenshot capture aborted",
-    );
     let r: BridgeResult;
     try {
+      const page = await abortable(this.ensureConnected(), opts.signal, "screenshot capture aborted");
       r = await this.capturePage(page, opts);
     } catch (err) {
       if (err instanceof JetKvmError && err.code === "Aborted") throw err;
-      // Stream went stale (host reboot, resolution change): reconnect once.
       await this.closePage();
-      const fresh = await abortable(
-        this.ensureConnected(),
-        opts.signal,
-        "screenshot capture aborted",
-      );
+      const fresh = await abortable(this.ensureConnected(), opts.signal, "screenshot capture aborted");
       r = await this.capturePage(fresh, opts);
     }
     this.lastCaptureAt = Date.now();
@@ -333,10 +341,13 @@ export class BrowserEngine implements ScreenshotEngine {
   }
 
   async dispose(): Promise<void> {
+    this.disposed = true;
     clearTimeout(this.idleTimer);
     this.idleTimer = undefined;
     const launching = this.pagePromise;
+    const connecting = this.connecting;
     if (launching) await launching.catch(() => {});
+    if (connecting) await connecting.catch(() => {});
     await this.closePage();
     if (this.bridgeServer) {
       this.bridgeServer.stop(true);

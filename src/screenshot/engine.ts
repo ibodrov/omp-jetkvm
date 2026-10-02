@@ -1,22 +1,51 @@
 /**
  * Screenshot engine contract + auto selection. DESIGN §3.2.
  */
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, fchmodSync, lstatSync, mkdirSync, openSync, statSync, writeFileSync, type Stats } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
-import { JetKvmError, timestampName } from "../util.ts";
+import { JetKvmError } from "../util.ts";
 import { findRecorderBin, RecorderEngine } from "./engine-recorder.ts";
 import type { DeviceConfig, JetKvmConfig } from "../config.ts";
 import { BrowserEngine } from "./engine-browser.ts";
 
-/** Write a capture's full-res bytes to the screenshot dir; returns the path. */
 export function writeScreenshotFile(fullB64: string, mime: string, dir: string): string {
-  mkdirSync(dir, { recursive: true });
+  let directory: Stats;
+  try {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    directory = lstatSync(dir);
+  } catch (err) {
+    throw new JetKvmError("ScreenshotStorageFailed", `cannot prepare screenshot directory: ${String(err)}`);
+  }
+  if (directory.isSymbolicLink() || !directory.isDirectory() ||
+      (typeof process.getuid === "function" && directory.uid !== process.getuid())) {
+    throw new JetKvmError("ScreenshotStorageFailed", "screenshot directory must be a real directory owned by this user");
+  }
+  chmodSync(dir, 0o700);
+  const verified = statSync(dir);
+  if ((verified.mode & 0o777) !== 0o700 ||
+      (typeof process.getuid === "function" && verified.uid !== process.getuid())) {
+    throw new JetKvmError("ScreenshotStorageFailed", "screenshot directory is not private");
+  }
   const ext = mime === "image/png" ? "png" : "jpg";
-  const path = join(dir, `jetkvm_${timestampName()}.${ext}`);
-  // Sync on purpose: the tool reports success with this path; a deferred
-  // write could fail after the fact (or reject unhandled) on ENOSPC etc.
-  writeFileSync(path, Buffer.from(fullB64, "base64"));
-  return path;
+  const bytes = Buffer.from(fullB64, "base64");
+  for (;;) {
+    const path = join(dir, `jetkvm_${Date.now()}_${randomUUID()}.${ext}`);
+    let fd: number;
+    try {
+      fd = openSync(path, "wx", 0o600);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EEXIST") continue;
+      throw err;
+    }
+    try {
+      fchmodSync(fd, 0o600);
+      writeFileSync(fd, bytes);
+    } finally {
+      closeSync(fd);
+    }
+    return path;
+  }
 }
 
 export interface CaptureOptions {
