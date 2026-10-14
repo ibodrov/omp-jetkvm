@@ -167,11 +167,19 @@ them resurfaces a load failure:
 ## Development
 
 ```sh
-bun install
-bunx tsc --noEmit     # typecheck
+bun install --frozen-lockfile
+bun run typecheck      # typecheck
 bun test              # unit + fake-device (werift) integration — no hardware needed
 JETKVM_HOST=… JETKVM_PASSWORD_FILE=… bun scripts/smoke.ts all   # live device
 ```
+
+Commit `bun.lock` to preserve the dependency graph validated by tests and live
+JetKVM checks; the legacy binary `bun.lockb` remains ignored. Use frozen installs
+for checkout setup and verification so manifest/lockfile mismatches fail rather
+than silently resolving a different graph. For intentional dependency or patch
+updates, regenerate the lockfile with `bun install` and commit it together with
+the corresponding manifest and patch changes. Consumers installing this package
+as a dependency still resolve through their own project's dependency graph.
 
 Dependency upgrades must pass `bun run typecheck`, `bun test`, and `bun audit`,
 then load through the actual omp extension loader: plain Bun checks do not
