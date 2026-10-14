@@ -1,8 +1,8 @@
 diff --git a/lib/common/src/transport.js b/lib/common/src/transport.js
-index 4f11da0c6df6a8c6e8cb44cf6e1a1c2090c1e60e..b40af44ae1ebd7cd48668a47667644f33ebc2b73 100644
+index a1cff0eeba1099179be0a59b686bf2a9b26caca7..a6b2a7298ffd237f01ef231f9dbd2dfe7990c397 100644
 --- a/lib/common/src/transport.js
 +++ b/lib/common/src/transport.js
-@@ -159,6 +159,12 @@ class UdpTransport {
+@@ -160,6 +160,12 @@ class UdpTransport {
              this.socket.bind({ address });
          }
          await new Promise((r) => this.socket.once("listening", r));
@@ -16,10 +16,10 @@ index 4f11da0c6df6a8c6e8cb44cf6e1a1c2090c1e60e..b40af44ae1ebd7cd48668a47667644f3
      get address() {
          return this.socket.address();
 diff --git a/lib/index.mjs b/lib/index.mjs
-index bd453cff7e694f564dff562025b3f6047d86ee50..fba26c5e7ec4fee381a3600e745f6659d86ff697 100644
+index 0fa37cb3c5ee7ad9c20a51ac589572eb504baf44..004bfbba32387515038c7541c27e11c51991e4ca 100644
 --- a/lib/index.mjs
 +++ b/lib/index.mjs
-@@ -679,6 +679,12 @@ var UdpTransport = class _UdpTransport {
+@@ -680,6 +680,12 @@ var UdpTransport = class _UdpTransport {
        this.socket.bind({ address });
      }
      await new Promise((r) => this.socket.once("listening", r));

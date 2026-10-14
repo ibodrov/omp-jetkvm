@@ -111,11 +111,11 @@ unmount before exiting; process exit necessarily ends local serving.
 - On an AMI Aptio host with firmware **0.5.9**, mounted recovery media was absent from the firmware boot menu despite USB mass storage being enabled. After disabling JetKVM's USB audio interface and rebooting, the same Alpine image booted. Treat this as a host compatibility workaround, not a reason to change USB interfaces automatically.
 - Video state events and RPC replies are complete snapshots, not patches. A recovered signal omits `error`; replacing the cached state clears the previous `no_signal` instead of reporting a healthy stream with a stale fault.
 
-- `werift@0.24.4` creates ICE `node:dgram` sockets without an `error`
+- `werift@0.25.0` creates ICE `node:dgram` sockets without an `error`
   listener. When a JetKVM reboots, Linux/Bun can deliver the resulting ICMP
   port rejection as a stackless `ECONNREFUSED: connection refused, recv`;
   EventEmitter otherwise promotes it to an uncaught exception and omp exits.
-  `patchedDependencies` applies `patches/werift@0.24.4.patch` to both werift
+  `patchedDependencies` applies `patches/werift@0.25.0.patch` to both werift
   entry builds. The socket error is now contained; the existing RPC keepalive
   tears down the dead session and a later idempotent call can reconnect.
   `test/connection-resilience.test.ts` reproduces the remote-port loss in a
@@ -172,6 +172,19 @@ bunx tsc --noEmit     # typecheck
 bun test              # unit + fake-device (werift) integration — no hardware needed
 JETKVM_HOST=… JETKVM_PASSWORD_FILE=… bun scripts/smoke.ts all   # live device
 ```
+
+Dependency upgrades must pass `bun run typecheck`, `bun test`, and `bun audit`,
+then load through the actual omp extension loader: plain Bun checks do not
+exercise omp's dependency bridge. The current dependency set is validated with
+Bun 1.3.14 and omp 18.10.4 against JetKVM firmware 0.5.9, including live browser
+captures, reversible keyboard input, mouse movement, and a temporary
+upload → mount → unmount → delete cycle. Keep Werift exactly pinned and rebase
+its UDP patch when upgrading; retain the loader patches above.
+
+The full live smoke suite injects keys and mounts `smoke.iso`; run it only on
+a host and media slot reserved for testing. For shared devices, use read-only
+checks first, avoid replacing existing media, and clean up only files created
+by the validation run.
 
 - `test/helpers/fake-device.ts` — werift server-side peer implementing the `rpc` contract; the firmware-drift canary.
 - `scripts/fake-pi.ts` — drive any tool directly from the CLI without an omp session. Loads the real extension, applies its policy hooks, and runs its shutdown hooks (including best-effort served-media retirement); policy blocks and tool errors exit nonzero. It does not provide omp's interactive approvals or full schema validation.
