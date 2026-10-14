@@ -163,13 +163,3 @@ export async function routeSourceAddress(
   opts.signal?.addEventListener("abort", onAbort, { once: true });
   return promise;
 }
-
-/** First non-internal IPv4 address of this machine (for serve_and_mount URLs). */
-export function pickLanIp(): string | null {
-  for (const ifaces of Object.values(os.networkInterfaces())) {
-    for (const iface of ifaces ?? []) {
-      if (iface.family === "IPv4" && !iface.internal) return iface.address;
-    }
-  }
-  return null;
-}

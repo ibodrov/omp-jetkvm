@@ -15,17 +15,6 @@ import type { DeviceSession } from "./connection.ts";
 // USB HID usage IDs (HID Usage Tables §10, Keyboard/Keypad page 0x07)
 // ---------------------------------------------------------------------------
 
-export const MODIFIER_BITS = {
-  leftCtrl: 0x01,
-  leftShift: 0x02,
-  leftAlt: 0x04,
-  leftGui: 0x08,
-  rightCtrl: 0x10,
-  rightShift: 0x20,
-  rightAlt: 0x40,
-  rightGui: 0x80,
-} as const;
-
 /** Named keys → HID usage ID. Chord tokens and `press` accept these names. */
 export const KEY_USAGE: Record<string, number> = {
   a: 0x04, b: 0x05, c: 0x06, d: 0x07, e: 0x08, f: 0x09, g: 0x0a, h: 0x0b, i: 0x0c,

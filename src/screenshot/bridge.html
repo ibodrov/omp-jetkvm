@@ -113,26 +113,6 @@
       const modelB64 = modelCanvas.toDataURL(format, (opts.quality ?? 75) / 100).split(",")[1];
       return { fullB64, modelB64, width: w, height: h, ageMs: Math.round(performance.now() - lastFrameAt) };
     },
-    state() {
-      return {
-        connected: pc ? pc.connectionState : null,
-        frameReady,
-        ageMs: frameReady ? Math.round(performance.now() - lastFrameAt) : null,
-        width: video.videoWidth,
-        height: video.videoHeight,
-      };
-    },
-    close() {
-      cancelFrameWatch();
-      if (pc) { try { pc.close(); } catch (e) {} }
-      pc = null;
-      frameReady = false;
-      lastFrameAt = 0;
-      video.srcObject = null;
-      video.load();
-      remoteDescriptionSet = false;
-      pendingCandidates = [];
-    },
   };
 })();
 </script>

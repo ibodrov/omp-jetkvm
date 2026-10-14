@@ -46,7 +46,7 @@ afterEach(() => {
 
 function fakeSession() {
   const calls: RecordedCall[] = [];
-  const locks: DeviceLocks = createDeviceLocks(1_000);
+  const locks: DeviceLocks = createDeviceLocks(25);
   const state: SimulatedInput = {
     modifier: 0, keys: [], buttons: 0, pointer: { x: 0, y: 0 },
     videoAvailable: true, rejectKeyboardRelease: false, rejectMouseRelease: false,
@@ -106,6 +106,15 @@ function fakeSession() {
   fixtures.push(fixture);
   return { session: fixture, calls, locks, state, connection };
 }
+
+async function expectInputAvailable(locks: DeviceLocks): Promise<void> {
+  const release = await locks.input.acquire("behavior-check");
+  release();
+}
+
+async function expectInputContended(locks: DeviceLocks): Promise<void> {
+  await expect(locks.input.acquire("behavior-check")).rejects.toMatchObject({ code: "InputBusy" });
+}
 function fakeZ(): ZodLike {
   const leaf = (): unknown => ({ kind: "leaf" });
   return {
@@ -141,7 +150,7 @@ describe("mouse down/up manual holds", () => {
     const mouse = calls.filter((c) => c.method === "absMouseReport").map((c) => c.params);
     // pixelToHid(960,1920)=16392, pixelToHid(540,1080)=16399; buttons stay down.
     expect(mouse).toEqual([{ x: 16392, y: 16399, buttons: 1 }]);
-    expect(locks.input.holderInfo).toMatchObject({ held: true });
+    await expectInputContended(locks);
   });
 
   test("up releases everything at the given position and unparks the mutex", async () => {
@@ -150,7 +159,7 @@ describe("mouse down/up manual holds", () => {
     await run(mouseTool(), { action: "up", x: 200, y: 300 });
     const mouse = calls.filter((c) => c.method === "absMouseReport").map((c) => c.params);
     expect(mouse[mouse.length - 1]).toMatchObject({ buttons: 0 });
-    expect(locks.input.holderInfo.held).toBe(false);
+    await expectInputAvailable(locks);
   });
 
   test("up without x/y releases at the last known pointer position, not the corner", async () => {
@@ -207,7 +216,7 @@ describe("release safety", () => {
     expect(result.isError).toBeFalsy();
     expect(state.buttons).toBe(0);
     expect(state.pointer).toEqual(heldAt);
-    expect(locks.input.holderInfo.held).toBe(false);
+    await expectInputAvailable(locks);
   });
 
   test("keyboard release rejection is reported while mouse release still runs", async () => {
@@ -219,7 +228,7 @@ describe("release safety", () => {
     expect(result).toMatchObject({ isError: true, details: { code: "InputReleaseFailed" } });
     expect(state.modifier).toBe(1);
     expect(state.buttons).toBe(0);
-    expect(locks.input.holderInfo.held).toBe(false);
+    await expectInputAvailable(locks);
   });
 
   test("mouse release rejection is not reported as success", async () => {
@@ -230,7 +239,7 @@ describe("release safety", () => {
     expect(result).toMatchObject({ isError: true, details: { code: "InputReleaseFailed" } });
     expect(state.buttons).toBe(1);
     expect(state.modifier).toBe(0);
-    expect(locks.input.holderInfo.held).toBe(false);
+    await expectInputAvailable(locks);
   });
 
   test("successful work cannot hide failed transaction cleanup", async () => {
@@ -251,7 +260,7 @@ describe("release safety", () => {
     });
     expect(state.modifier).toBe(1);
     expect(state.buttons).toBe(1);
-    expect(locks.input.holderInfo.held).toBe(false);
+    await expectInputAvailable(locks);
   });
 
   test("ambiguous manual hold reports its failed cleanup rather than only the lost response", async () => {
@@ -268,7 +277,7 @@ describe("release safety", () => {
     const result = await run(keyboardTool(), { action: "down", keys: "ctrl" });
     expect(result).toMatchObject({ isError: true, details: { code: "InputReleaseFailed" } });
     expect(state.modifier).toBe(1);
-    expect(locks.input.holderInfo.held).toBe(false);
+    await expectInputAvailable(locks);
   });
 });
 
@@ -282,7 +291,7 @@ describe("connection recovery does not block the input queue", () => {
     const pending = run(mouseTool(), { action, x: 10, y: 10 });
     await connection.started.promise;
     try {
-      expect(locks.input.holderInfo.held).toBe(false);
+      await expectInputAvailable(locks);
       const release = await locks.input.acquire("other-caller");
       release();
     } finally {
@@ -291,13 +300,13 @@ describe("connection recovery does not block the input queue", () => {
     const result = await pending;
     expect(result.isError).toBeFalsy();
     await run(keyboardTool(), { action: "release_all" });
-    expect(locks.input.holderInfo.held).toBe(false);
+    await expectInputAvailable(locks);
   });
 });
 describe("ambiguous input failures", () => {
   test("a lost key-down response still triggers a zero cleanup report", async () => {
     const reports: Record<string, unknown>[] = [];
-    const locks = createDeviceLocks(1_000);
+    const locks = createDeviceLocks(25);
     const session = {
       auth: { tokenRotatedRecently: () => false },
       locks,
@@ -322,11 +331,11 @@ describe("ambiguous input failures", () => {
       }),
     ).rejects.toThrow(/response lost/);
     expect(reports.map((report) => report["modifier"])).toEqual([1, 0]);
-    expect(locks.input.holderInfo.held).toBe(false);
+    await expectInputAvailable(locks);
   });
   test("a failed keyboard cleanup still attempts mouse cleanup", async () => {
     const mouseReports: Record<string, unknown>[] = [];
-    const locks = createDeviceLocks(1_000);
+    const locks = createDeviceLocks(25);
     let failKeyboardCleanup = true;
     const session = {
       auth: { tokenRotatedRecently: () => false },
@@ -355,7 +364,7 @@ describe("ambiguous input failures", () => {
     ).rejects.toMatchObject({ code: "InputReleaseFailed", cause: operationError });
     expect(mouseReports).toContainEqual({ x: 10, y: 20, buttons: 1 });
     expect(mouseReports).toContainEqual({ x: 10, y: 20, buttons: 0 });
-    expect(locks.input.holderInfo.held).toBe(false);
+    await expectInputAvailable(locks);
   });
 
 });
@@ -365,9 +374,11 @@ describe("teardown drains parked holds", () => {
     const real = new DeviceSession("drain-test", { host: "10.243.0.99" }, cfg);
     const release = await real.locks.input.acquire("holder-x");
     registerHeldRelease(real, release);
-    expect(real.locks.input.holderInfo.held).toBe(true);
+    const contention = real.locks.input.acquire("competitor");
     await real.dispose();
-    expect(real.locks.input.holderInfo.held).toBe(false);
+    const acquired = await contention;
+    acquired();
+    await expectInputAvailable(real.locks);
   });
 });
 

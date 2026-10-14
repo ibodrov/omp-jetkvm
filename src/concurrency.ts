@@ -104,9 +104,6 @@ export class AsyncMutex {
     };
   }
 
-  get holderInfo(): { held: boolean; holder: string; since: number } {
-    return { held: this.locked, holder: this.currentHolder, since: this.heldSince };
-  }
 }
 
 export interface DeviceLocks {
@@ -213,7 +210,7 @@ function pidAlive(pid: number): boolean {
  * `force` steals an existing claim whose owning pid is alive (user-ordered override).
  * Throws DeviceBusy when someone else holds a live claim.
  */
-export function acquireCrossProcessClaim(origin: string, opts: { enabled: boolean; force?: boolean }): CrossProcessClaim {
+export function acquireCrossProcessClaim(origin: string, opts: { force?: boolean } = {}): CrossProcessClaim {
   const normalized = normalizedOrigin(origin);
   const info: ClaimInfo = {
     pid: process.pid,
@@ -222,9 +219,6 @@ export function acquireCrossProcessClaim(origin: string, opts: { enabled: boolea
     owner: randomUUID(),
     startTicks: pidStartTicks(process.pid),
   };
-  if (!opts.enabled) {
-    return { info, release() {} };
-  }
 
   const path = infoFilePath(normalized);
   if (process.platform === "linux") {

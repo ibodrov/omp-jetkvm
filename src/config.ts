@@ -3,7 +3,7 @@
  * Reads `<project>/.omp/config.yml` (wins) and `~/.omp/agent/config.yml`,
  * key `jetkvm:`. DESIGN §5.
  */
-import { readFileSync, statSync, existsSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { parse } from "yaml";
 import { expandTilde, JetKvmError } from "./util.ts";
 
@@ -153,25 +153,14 @@ function candidatePaths(cwd: string): string[] {
   ];
 }
 
-let cached: { key: string; config: JetKvmConfig } | null = null;
-
 /**
  * Load the `jetkvm:` config key, merged user → project (project wins).
- * Cached per (path, mtime) so tool calls don't re-parse on every invocation.
+ * The extension loads this once at registration and retains the result.
  * Returns the merged config even when no `jetkvm:` key exists (empty devices)
  * so callers can decide how to surface "not configured".
  */
 export function loadJetKvmConfig(cwd: string): JetKvmConfig {
   let config: JetKvmConfig = structuredClone(JETKVM_CONFIG_DEFAULTS);
-  const stamp: string[] = [];
-  for (const path of candidatePaths(cwd)) {
-    if (!existsSync(path)) continue;
-    const stat = statSync(path);
-    stamp.push(`${path}:${stat.mtimeMs}`);
-  }
-  const key = stamp.join("|");
-  if (cached && cached.key === key) return cached.config;
-
   for (const path of candidatePaths(cwd)) {
     if (!existsSync(path)) continue;
     let parsed: unknown;
@@ -190,13 +179,7 @@ export function loadJetKvmConfig(cwd: string): JetKvmConfig {
     config = deepMerge(config, jetkvm);
   }
   validateConfig(config);
-  cached = { key, config };
   return config;
-}
-
-/** Reset the cache (tests). */
-export function resetConfigCache(): void {
-  cached = null;
 }
 
 /** Resolve a device by name; `undefined` means "the default device". */
@@ -216,7 +199,7 @@ export function resolveDevice(cfg: JetKvmConfig, device?: string): DeviceConfig 
 }
 
 /** Normalize a device host into origin + hostname. */
-export function splitOrigin(host: string): { origin: string; hostname: string; secure: boolean } {
+export function splitOrigin(host: string): { origin: string; hostname: string } {
   if (host.trim() !== host || host === "") {
     throw new JetKvmError("ConfigError", "device host must be a non-empty string without surrounding whitespace");
   }
@@ -233,7 +216,7 @@ export function splitOrigin(host: string): { origin: string; hostname: string; s
   if (url.username || url.password || url.pathname !== "/" || url.search || url.hash) {
     throw new JetKvmError("ConfigError", `device host "${host}" must contain only a hostname and optional port`);
   }
-  return { origin: url.origin, hostname: url.hostname, secure: url.protocol === "https:" };
+  return { origin: url.origin, hostname: url.hostname };
 }
 
 /** Resolve the device password: `password` → `passwordEnv` → `passwordFile`. */

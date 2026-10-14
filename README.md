@@ -46,6 +46,9 @@ jetkvm:
     forceUnmountOnMount: true
 ```
 
+Configuration is merged user → project once when the extension registers.
+Restart the session to apply changes; tool calls use that configuration snapshot.
+
 Full schema and design rationale: `DESIGN.md`.
 
 ## Screenshot engines
@@ -171,8 +174,9 @@ JETKVM_HOST=… JETKVM_PASSWORD_FILE=… bun scripts/smoke.ts all   # live devic
 ```
 
 - `test/helpers/fake-device.ts` — werift server-side peer implementing the `rpc` contract; the firmware-drift canary.
-- `scripts/fake-pi.ts` — drive any tool directly from the CLI without an omp session; tool errors exit nonzero.
+- `scripts/fake-pi.ts` — drive any tool directly from the CLI without an omp session. Loads the real extension, applies its policy hooks, and runs its shutdown hooks (including best-effort served-media retirement); policy blocks and tool errors exit nonzero. It does not provide omp's interactive approvals or full schema validation.
 - `scripts/check-control-plane.ts` — connection/auth/RPC sanity.
+- Use `bun scripts/fake-pi.ts jetkvm_screenshot '{"action":"capture"}'` to exercise the production capture path rather than a separate bridge probe. Use an omp session for persistent `serve_and_mount` media: the one-shot CLI runs bounded media retirement before exiting.
 
 ## Install (omp plugin)
 

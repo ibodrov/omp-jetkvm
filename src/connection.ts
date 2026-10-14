@@ -331,8 +331,6 @@ export class DeviceSession {
   lastError: string | null = null;
   videoState: VideoState = {};
   atxState: { power?: boolean; hdd?: boolean } = {};
-  usbState: unknown = null;
-  foreignInputWarnings: string[] = [];
   /** Last mouse position we reported (HID space) — release paths use it
    *  instead of (0,0) so releasing buttons never teleports the cursor. */
   lastMouse: { x: number; y: number } | null = null;
@@ -344,9 +342,6 @@ export class DeviceSession {
     this.auth = sharedAuthState(dev);
     this.locks = createDeviceLocks(cfg.concurrency.queueTimeoutMs);
   }
-  get rpcClient(): JsonRpcClient | null {
-    return this.rpc;
-  }
 
   get claimInfo() {
     return peekCrossProcessClaim(this.auth.origin) ?? this.claim?.info ?? null;
@@ -357,7 +352,7 @@ export class DeviceSession {
     if (this.cfg.concurrency.crossProcess !== "lock") return;
     if (this.claim && crossProcessClaimIsCurrent(this.claim)) return;
     this.claim?.release();
-    this.claim = acquireCrossProcessClaim(this.auth.origin, { enabled: true, force });
+    this.claim = acquireCrossProcessClaim(this.auth.origin, { force });
   }
 
   private startKeepalive(): void {
@@ -403,9 +398,6 @@ export class DeviceSession {
         break;
       case "atxState":
         this.atxState = event.params as { power?: boolean; hdd?: boolean };
-        break;
-      case "usbState":
-        this.usbState = event.params;
         break;
       default:
         break;

@@ -7,7 +7,7 @@ import { JetKvmError } from "../src/util.ts";
 import { describe, expect, test } from "bun:test";
 import { parseRange } from "../src/storage.ts";
 import { policyGate } from "../src/intercept.ts";
-import { loadJetKvmConfig, resetConfigCache, resolveDevice, splitOrigin } from "../src/config.ts";
+import { loadJetKvmConfig, resolveDevice, splitOrigin } from "../src/config.ts";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { writeScreenshotFile } from "../src/screenshot/engine.ts";
 describe("AsyncMutex", () => {
@@ -15,7 +15,6 @@ describe("AsyncMutex", () => {
     const m = new AsyncMutex("input", 1_000);
     const order: string[] = [];
     const r1 = await m.acquire("a");
-    expect(m.holderInfo).toMatchObject({ held: true, holder: "a" });
     const p2 = m.acquire("b").then((r) => {
       order.push("b-acquired");
       return r;
@@ -24,15 +23,20 @@ describe("AsyncMutex", () => {
     const r2 = await p2;
     expect(order).toEqual(["b-acquired"]);
     r2();
+    const r3 = await m.acquire("after-queue");
+    r3();
   });
 
-  test("contention fails fast with holder info", async () => {
-    // The queue timeout IS the mechanism under test; awaiting its rejection
-    // (a real signal) is the deterministic observable. 30ms real cost.
+  test("contention times out with holder diagnostics", async () => {
     const m = new AsyncMutex("storage", 30);
     const release = await m.acquire("holder-1");
-    await expect(m.acquire("holder-2")).rejects.toThrow(/storage transaction could not start.*holder-1/);
+    await expect(m.acquire("holder-2")).rejects.toMatchObject({
+      code: "StorageBusy",
+      details: { holder: "holder-1", since: expect.any(Number), kind: "storage" },
+    });
     release();
+    const reacquired = await m.acquire("after-contention");
+    reacquired();
   });
 
 
@@ -46,14 +50,16 @@ describe("AsyncMutex", () => {
     r2();
     const r3 = await p3;
     r3();
-    expect(m.holderInfo.held).toBe(false);
+    const reacquired = await m.acquire("after-queue");
+    reacquired();
   });
   test("pre-aborted waiters fail without entering the queue", async () => {
     const mutex = new AsyncMutex("input", 1_000);
     const controller = new AbortController();
     controller.abort();
     await expect(mutex.acquire("cancelled", controller.signal)).rejects.toThrow(/aborted/);
-    expect(mutex.holderInfo.held).toBe(false);
+    const release = await mutex.acquire("available");
+    release();
   });
 
 });
@@ -138,14 +144,12 @@ describe("config", () => {
     );
     const previousHome = process.env.HOME;
     process.env.HOME = tmp;
-    resetConfigCache();
     try {
       const cfg = loadJetKvmConfig(tmp);
       expect(cfg.devices["default"]?.host).toBe("10.0.0.2");
       expect(cfg.session.rpcTimeoutMs).toBe(2000);
     } finally {
       process.env.HOME = previousHome;
-      resetConfigCache();
       rmSync(tmp, { recursive: true, force: true });
     }
   });
@@ -156,12 +160,10 @@ describe("config", () => {
     writeFileSync(`${tmp}/.omp/config.yml`, ["jetkvm:", "  screenshot: null"].join("\n"));
     const previousHome = process.env.HOME;
     process.env.HOME = tmp;
-    resetConfigCache();
     try {
       expect(() => loadJetKvmConfig(tmp)).toThrow(/jetkvm\.screenshot must be a mapping/);
     } finally {
       process.env.HOME = previousHome;
-      resetConfigCache();
       rmSync(tmp, { recursive: true, force: true });
     }
   });
@@ -173,18 +175,16 @@ describe("config", () => {
     const prevHome = process.env.HOME;
     process.env.HOME = tmp;
     try {
-      resetConfigCache();
       const cfg = loadJetKvmConfig(tmp);
       expect(() => resolveDevice(cfg, "default")).toThrow(/no JetKVM device is configured/);
     } finally {
       process.env.HOME = prevHome;
-      resetConfigCache();
     }
   });
 
   test("splitOrigin handles scheme-less hosts and ports", () => {
-    expect(splitOrigin("192.168.1.100")).toEqual({ origin: "http://192.168.1.100", hostname: "192.168.1.100", secure: false });
-    expect(splitOrigin("https://kvm.example.com:8443/")).toEqual({ origin: "https://kvm.example.com:8443", hostname: "kvm.example.com", secure: true });
+    expect(splitOrigin("192.168.1.100")).toEqual({ origin: "http://192.168.1.100", hostname: "192.168.1.100" });
+    expect(splitOrigin("https://kvm.example.com:8443/")).toEqual({ origin: "https://kvm.example.com:8443", hostname: "kvm.example.com" });
   });
 });
 
@@ -199,17 +199,17 @@ describe("JetKvmError shape", () => {
 
 describe("cross-process claim liveness (pid reuse)", () => {
   test("a live claim is recognized via pid + start time", () => {
-    const claim = acquireCrossProcessClaim("claim-test.local", { enabled: true });
+    const claim = acquireCrossProcessClaim("claim-test.local");
     expect(holderIsLive(claim.info)).toBe(true);
     claim.release();
     expect(peekCrossProcessClaim("claim-test.local")).toBeNull();
   });
 
   test("a second live claim is rejected synchronously", () => {
-    const first = acquireCrossProcessClaim("claim-contention-test.local", { enabled: true });
+    const first = acquireCrossProcessClaim("claim-contention-test.local");
     try {
       expect(() =>
-        acquireCrossProcessClaim("claim-contention-test.local", { enabled: true }),
+        acquireCrossProcessClaim("claim-contention-test.local"),
       ).toThrow(/claimed/);
     } finally {
       first.release();
@@ -217,9 +217,9 @@ describe("cross-process claim liveness (pid reuse)", () => {
   });
   test("origin aliases share one cross-process ownership key", () => {
     const name = `claim-origin-${randomUUID()}.local`;
-    const claim = acquireCrossProcessClaim(name, { enabled: true });
+    const claim = acquireCrossProcessClaim(name);
     try {
-      expect(() => acquireCrossProcessClaim(`http://${name}`, { enabled: true })).toThrow(/claimed/);
+      expect(() => acquireCrossProcessClaim(`http://${name}`)).toThrow(/claimed/);
       expect(claim.info.origin).toBe(`http://${name}`);
     } finally {
       claim.release();
@@ -228,7 +228,7 @@ describe("cross-process claim liveness (pid reuse)", () => {
 
   test("an old owner release does not unlink a replacement publication", () => {
     const origin = `http://claim-replaced-${randomUUID()}.local`;
-    const claim = acquireCrossProcessClaim(origin, { enabled: true });
+    const claim = acquireCrossProcessClaim(origin);
     const path = join(
       os.homedir(),
       ".cache/omp-jetkvm",

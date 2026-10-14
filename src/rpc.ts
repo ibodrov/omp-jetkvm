@@ -24,9 +24,6 @@ interface Pending {
   method: string;
 }
 
-/** Error codes the device uses (DESIGN §2.3). */
-export const DEVICE_METHOD_NOT_FOUND = -32601;
-
 export class JsonRpcClient {
   private nextId = 1;
   private readonly pending = new Map<number, Pending>();
@@ -37,10 +34,6 @@ export class JsonRpcClient {
     private readonly sendText: (text: string) => void,
     private readonly defaultTimeoutMs: number,
   ) {}
-
-  get isOpen(): boolean {
-    return this.closed === null;
-  }
 
   /**
    * Feed one raw datachannel message. Responses match pending ids;

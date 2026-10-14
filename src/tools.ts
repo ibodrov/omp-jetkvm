@@ -78,10 +78,6 @@ export interface ToolDefinitionLike {
     isError?: boolean;
   }>;
 }
-export interface RegisterToolFn {
-  (def: ToolDefinitionLike): void;
-}
-
 const STORAGE_READ_ACTIONS: Record<string, true> = {
   state: true,
   space: true,
@@ -189,7 +185,7 @@ export function buildScreenshotTool(cfg: JetKvmConfig, z: ZodLike): ToolDefiniti
       quality: z.optional(z.number()),
       maxModelWidth: z.optional(z.number()),
     }),
-    async execute(toolCallId, params, signal, onUpdate, ctx) {
+    async execute(_toolCallId, params, signal, onUpdate, ctx) {
       try {
         const deviceName = (params["device"] as string | undefined) ?? undefined;
         const action = (params["action"] as string) ?? "capture";
@@ -678,7 +674,7 @@ export function buildDeviceTool(cfg: JetKvmConfig, z: ZodLike): ToolDefinitionLi
       layout: z.optional(z.string()),
       force: z.optional(z.boolean()),
     }),
-    async execute(toolCallId, params, signal) {
+    async execute(_toolCallId, params, signal) {
       try {
         const deviceName = (params["device"] as string | undefined) ?? undefined;
         const session = new ConnectionManager(cfg).session(deviceName);

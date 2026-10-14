@@ -28,8 +28,6 @@ declare global {
         width: number;
         height: number;
       }>;
-      state(): { connected?: string | boolean; frameReady?: boolean; width?: number; height?: number; ageMs?: number | null };
-      close(): void;
     };
   }
 }
@@ -56,13 +54,12 @@ export class BrowserEngine implements ScreenshotEngine {
   private idleCleanup: Promise<void> | null = null;
   private activeCaptures = 0;
   private connecting: Promise<void> | null = null;
-  private lastCaptureAt = 0;
   private disposed = false;
   private readonly auth: AuthState;
 
   constructor(
     private readonly chromiumPath: string,
-    private readonly dev: DeviceConfig,
+    dev: DeviceConfig,
     private readonly cfg: JetKvmConfig,
   ) {
     // Shared per-origin AuthState: a private instance would re-login and
@@ -311,7 +308,6 @@ export class BrowserEngine implements ScreenshotEngine {
         r = await this.capturePage(fresh, opts);
       }
       if (this.disposed) throw new JetKvmError("Aborted", "screenshot capture aborted");
-      this.lastCaptureAt = Date.now();
       return {
         modelData: r.modelB64,
         modelMime: opts.format === "png" ? "image/png" : "image/jpeg",
@@ -326,9 +322,6 @@ export class BrowserEngine implements ScreenshotEngine {
     }
   }
 
-  get lastCapture(): number {
-    return this.lastCaptureAt;
-  }
 
   private async closePage(): Promise<void> {
     const page = this.page;

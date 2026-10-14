@@ -4,7 +4,6 @@ import {
   foreignInputCheck,
   hidKeysPayload,
   KEY_USAGE,
-  MODIFIER_BITS,
   parseChord,
   pressChord,
   prepareText,
@@ -34,17 +33,35 @@ describe("USB HID keymap (HID Usage Tables)", () => {
     expect(KEY_USAGE["up"]).toBe(0x52);
     expect(KEY_USAGE["printscreen"]).toBe(0x46);
   });
-
-  test("modifier bitmask per DESIGN §2.4", () => {
-    expect(MODIFIER_BITS.leftCtrl).toBe(1);
-    expect(MODIFIER_BITS.leftShift).toBe(2);
-    expect(MODIFIER_BITS.leftAlt).toBe(4);
-    expect(MODIFIER_BITS.leftGui).toBe(8);
-    expect(MODIFIER_BITS.rightCtrl).toBe(0x10);
-    expect(MODIFIER_BITS.rightShift).toBe(0x20);
-    expect(MODIFIER_BITS.rightAlt).toBe(0x40);
-    expect(MODIFIER_BITS.rightGui).toBe(0x80);
+  test("all eight modifiers are parsed and sent in their HID report", async () => {
+    const modifiers = [
+      ["left-ctrl", 0x01],
+      ["left-shift", 0x02],
+      ["left-alt", 0x04],
+      ["lgui", 0x08],
+      ["right-ctrl", 0x10],
+      ["right-shift", 0x20],
+      ["right-alt", 0x40],
+      ["rgui", 0x80],
+    ] as const;
+    for (const [name, mask] of modifiers) {
+      const chord = parseChord(name);
+      expect(chord).toEqual({ modifierMask: mask, usages: [] });
+      const reports: { modifier: number; usages: number[] }[] = [];
+      const tx: InputTransaction = {
+        async keyboardReport(modifier, usages) {
+          reports.push({ modifier, usages });
+        },
+        async mouseReport() {},
+        async wheelReport() {},
+        async abortableSleep() {},
+      };
+      await pressChord(tx, chord, 0);
+      expect(reports[0]).toEqual({ modifier: mask, usages: [] });
+      expect(reports[reports.length - 1]).toEqual({ modifier: 0, usages: [] });
+    }
   });
+
 
   test("US char mapping incl. shifted symbols", () => {
     expect(CHAR_USAGE["a"]).toEqual({ usage: 0x04, shift: false });

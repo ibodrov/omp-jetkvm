@@ -168,9 +168,9 @@ describe("fake device harness", () => {
       try {
         await reachedGate;
         await session.dispose();
-        expect(session.rpcClient).toBeNull();
+        expect(session.state).toBe("idle");
         release();
-        await pending;
+        await expect(pending).resolves.toBeNull();
       } finally {
         release();
         await session.dispose();
@@ -238,7 +238,7 @@ describe("fake device harness", () => {
         width: 1920,
         height: 1080,
       });
-      competitor = acquireCrossProcessClaim(`http://${host}`, { enabled: true });
+      competitor = acquireCrossProcessClaim(`http://${host}`);
       await expect(session.call("keyboardReport", { modifier: 0, keys: [] })).rejects.toMatchObject({
         code: "DeviceBusy",
       });

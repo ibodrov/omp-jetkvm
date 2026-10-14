@@ -25,7 +25,7 @@ test("portable claims fail closed during publication and preserve replacement ow
       import { JetKvmError } from ${JSON.stringify(utility)};
       Object.defineProperty(process, "platform", { value: "darwin" });
       const origin = "https://portable-claim-test.invalid:8443";
-      const seed = acquireCrossProcessClaim(origin, { enabled: true });
+      const seed = acquireCrossProcessClaim(origin);
       const metadata = seed.info;
       const publicationName = readdirSync(process.env.HOME, { recursive: true }).find(name => typeof name === "string" && name.endsWith(".json"));
       if (!publicationName) throw new Error("claim publication fixture unavailable");
@@ -34,25 +34,25 @@ test("portable claims fail closed during publication and preserve replacement ow
       const fd = openSync(path, "wx", 0o600);
       let incompleteBlocked = false;
       try {
-        try { const unexpected = acquireCrossProcessClaim(origin, { enabled: true }); unexpected.release(); }
+        try { const unexpected = acquireCrossProcessClaim(origin); unexpected.release(); }
         catch (error) { incompleteBlocked = error instanceof JetKvmError && error.code === "DeviceBusy"; }
       } finally { closeSync(fd); if (existsSync(path)) unlinkSync(path); }
       writeFileSync(path, JSON.stringify({ ...metadata, startTicks: "invalid" }), { mode: 0o600 });
       let malformedBlocked = false;
       try {
-        try { const unexpected = acquireCrossProcessClaim(origin, { enabled: true }); unexpected.release(); }
+        try { const unexpected = acquireCrossProcessClaim(origin); unexpected.release(); }
         catch (error) { malformedBlocked = error instanceof JetKvmError && error.code === "DeviceBusy"; }
       } finally { if (existsSync(path)) unlinkSync(path); }
-      const first = acquireCrossProcessClaim(origin, { enabled: true });
-      const replacement = acquireCrossProcessClaim(origin, { enabled: true, force: true });
+      const first = acquireCrossProcessClaim(origin);
+      const replacement = acquireCrossProcessClaim(origin, { force: true });
       first.release();
       const replacementPreserved = crossProcessClaimIsCurrent(replacement) && peekCrossProcessClaim(origin)?.owner === replacement.info.owner;
       let thirdOwnerBlocked = false;
       try {
-        try { const unexpected = acquireCrossProcessClaim(origin, { enabled: true }); unexpected.release(); }
+        try { const unexpected = acquireCrossProcessClaim(origin); unexpected.release(); }
         catch (error) { thirdOwnerBlocked = error instanceof JetKvmError && error.code === "DeviceBusy"; }
       } finally { replacement.release(); }
-      const finalOwner = acquireCrossProcessClaim(origin, { enabled: true });
+      const finalOwner = acquireCrossProcessClaim(origin);
       finalOwner.release();
       console.log(JSON.stringify({ incompleteBlocked, malformedBlocked, replacementPreserved, thirdOwnerBlocked, released: peekCrossProcessClaim(origin) === null }));
     `], { env: { ...process.env, HOME: home }, stdout: "pipe", stderr: "pipe" });

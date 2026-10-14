@@ -5,7 +5,6 @@
  */
 import { describe, expect, test } from "bun:test";
 import jetkvmExtension from "../src/index.ts";
-import { resetConfigCache } from "../src/config.ts";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 
 interface RegisteredTool {
@@ -55,7 +54,6 @@ describe("extension factory", () => {
     const prevHome = process.env.HOME;
     process.chdir(tmp);
     process.env.HOME = tmp;
-    resetConfigCache();
     try {
       const { tools, pi } = fakePi();
       await jetkvmExtension(pi);
@@ -72,7 +70,6 @@ describe("extension factory", () => {
     } finally {
       process.chdir(prevCwd);
       process.env.HOME = prevHome;
-      resetConfigCache();
       rmSync(tmp, { recursive: true, force: true });
     }
   });
@@ -84,7 +81,6 @@ describe("extension factory", () => {
     const prevHome = process.env.HOME;
     process.chdir(tmp);
     process.env.HOME = tmp;
-    resetConfigCache();
     try {
       const { tools, pi } = fakePi();
       await jetkvmExtension(pi);
@@ -105,7 +101,6 @@ describe("extension factory", () => {
     } finally {
       process.chdir(prevCwd);
       process.env.HOME = prevHome;
-      resetConfigCache();
       rmSync(tmp, { recursive: true, force: true });
     }
   });
