@@ -53,6 +53,8 @@ export class BrowserEngine implements ScreenshotEngine {
   private chromiumDir: string | null = null;
   private bridgeServer: ReturnType<typeof Bun.serve> | null = null;
   private idleTimer: Timer | undefined;
+  private idleCleanup: Promise<void> | null = null;
+  private activeCaptures = 0;
   private connecting: Promise<void> | null = null;
   private lastCaptureAt = 0;
   private disposed = false;
@@ -90,9 +92,25 @@ export class BrowserEngine implements ScreenshotEngine {
   private armIdleKill(): void {
     clearTimeout(this.idleTimer);
     this.idleTimer = setTimeout(() => {
-      void this.dispose().catch(() => {});
+      this.idleTimer = undefined;
+      if (this.disposed || this.activeCaptures > 0 || this.idleCleanup) return;
+      const pending = this.releaseIdleResources();
+      this.idleCleanup = pending;
+      const settled = (): void => { if (this.idleCleanup === pending) this.idleCleanup = null; };
+      pending.then(settled, settled);
     }, this.cfg.screenshot.idleTimeoutMs);
     this.idleTimer.unref?.();
+  }
+
+  private async releaseIdleResources(): Promise<void> {
+    // A canceled caller may leave shared startup/signaling running. Drain it
+    // before cleanup, and retain the page if another capture has arrived.
+    const launching = this.pagePromise;
+    const connecting = this.connecting;
+    if (launching) await launching.catch(() => {});
+    if (connecting) await connecting.catch(() => {});
+    if (this.disposed || this.activeCaptures > 0) return;
+    await this.releaseResources();
   }
 
   /**
@@ -104,6 +122,7 @@ export class BrowserEngine implements ScreenshotEngine {
    * --remote-debugging-port=0; we parse and connect.
    */
   private async ensurePage(): Promise<Page> {
+    if (this.idleCleanup) await this.idleCleanup;
     if (this.disposed) throw new JetKvmError("Aborted", "screenshot engine disposed");
     if (this.page && this.browser && !this.page.isClosed()) return this.page;
     if (this.pagePromise) return this.pagePromise;
@@ -272,26 +291,39 @@ export class BrowserEngine implements ScreenshotEngine {
 
   async capture(opts: CaptureOptions): Promise<CaptureResult> {
     if (this.disposed || opts.signal?.aborted) throw new JetKvmError("Aborted", "screenshot capture aborted");
-    this.armIdleKill();
-    let r: BridgeResult;
+    clearTimeout(this.idleTimer);
+    this.idleTimer = undefined;
+    this.activeCaptures++;
     try {
-      const page = await abortable(this.ensureConnected(), opts.signal, "screenshot capture aborted");
-      r = await this.capturePage(page, opts);
-    } catch (err) {
-      if (err instanceof JetKvmError && err.code === "Aborted") throw err;
-      await this.closePage();
-      const fresh = await abortable(this.ensureConnected(), opts.signal, "screenshot capture aborted");
-      r = await this.capturePage(fresh, opts);
+      // Cleanup owns the old resources until it finishes. In particular, its
+      // browser/profile teardown must not reach a newly launched page.
+      if (this.idleCleanup) await abortable(this.idleCleanup, opts.signal, "screenshot capture aborted");
+      if (this.disposed || opts.signal?.aborted) throw new JetKvmError("Aborted", "screenshot capture aborted");
+      let r: BridgeResult;
+      try {
+        const page = await abortable(this.ensureConnected(), opts.signal, "screenshot capture aborted");
+        r = await this.capturePage(page, opts);
+      } catch (err) {
+        if (this.disposed) throw new JetKvmError("Aborted", "screenshot capture aborted");
+        if (err instanceof JetKvmError && err.code === "Aborted") throw err;
+        await this.closePage();
+        const fresh = await abortable(this.ensureConnected(), opts.signal, "screenshot capture aborted");
+        r = await this.capturePage(fresh, opts);
+      }
+      if (this.disposed) throw new JetKvmError("Aborted", "screenshot capture aborted");
+      this.lastCaptureAt = Date.now();
+      return {
+        modelData: r.modelB64,
+        modelMime: opts.format === "png" ? "image/png" : "image/jpeg",
+        fullData: r.fullB64,
+        fullMime: opts.format === "png" ? "image/png" : "image/jpeg",
+        width: r.width,
+        height: r.height,
+      };
+    } finally {
+      this.activeCaptures--;
+      if (!this.disposed && this.activeCaptures === 0) this.armIdleKill();
     }
-    this.lastCaptureAt = Date.now();
-    return {
-      modelData: r.modelB64,
-      modelMime: opts.format === "png" ? "image/png" : "image/jpeg",
-      fullData: r.fullB64,
-      fullMime: opts.format === "png" ? "image/png" : "image/jpeg",
-      width: r.width,
-      height: r.height,
-    };
   }
 
   get lastCapture(): number {
@@ -300,7 +332,13 @@ export class BrowserEngine implements ScreenshotEngine {
 
   private async closePage(): Promise<void> {
     const page = this.page;
+    const browser = this.browser;
+    const child = this.chromiumProc;
+    const dir = this.chromiumDir;
     this.page = null;
+    this.browser = null;
+    this.chromiumProc = null;
+    this.chromiumDir = null;
     if (page) {
       try {
         await page.close();
@@ -308,8 +346,6 @@ export class BrowserEngine implements ScreenshotEngine {
         // already closed
       }
     }
-    const browser = this.browser;
-    this.browser = null;
     if (browser) {
       try {
         // We spawned this browser ourselves: close() both disconnects the
@@ -319,18 +355,41 @@ export class BrowserEngine implements ScreenshotEngine {
         // already closed
       }
     }
-    const child = this.chromiumProc;
-    this.chromiumProc = null;
-    if (child && child.exitCode === null) {
-      child.kill("SIGTERM");
-      // Fire-and-forget escalate: browser.close() normally ends it; SIGKILL
-      // is the belt for wedged renderers.
-      setTimeout(() => {
-        if (child.exitCode === null) child.kill("SIGKILL");
-      }, 2_000).unref?.();
+    if (child?.pid && child.exitCode === null && child.signalCode === null) {
+      const { promise: exited, resolve, reject } = Promise.withResolvers<void>();
+      const onExit = (): void => resolve();
+      const onError = (err: Error): void => reject(err);
+      child.once("exit", onExit);
+      child.once("error", onError);
+      let timer: Timer | undefined;
+      const sendSignal = (signal: NodeJS.Signals): boolean => {
+        try {
+          const sent = child.kill(signal);
+          // ESRCH returns false without an exit event; an emitted error or
+          // thrown signal failure rejects instead of stranding the waiter.
+          if (!sent) resolve();
+          return sent;
+        } catch (err) {
+          reject(err);
+          return false;
+        }
+      };
+      try {
+        if (sendSignal("SIGTERM")) {
+          timer = setTimeout(() => {
+            if (child.exitCode !== null || child.signalCode !== null) resolve();
+            else sendSignal("SIGKILL");
+          }, 2_000);
+          timer.unref?.();
+        }
+        // Keep cleanup pending until Chromium exits or signaling settles.
+        await exited;
+      } finally {
+        clearTimeout(timer);
+        child.off("exit", onExit);
+        child.off("error", onError);
+      }
     }
-    const dir = this.chromiumDir;
-    this.chromiumDir = null;
     if (dir) {
       try {
         rmSync(dir, { recursive: true, force: true });
@@ -340,18 +399,23 @@ export class BrowserEngine implements ScreenshotEngine {
     }
   }
 
-  async dispose(): Promise<void> {
-    this.disposed = true;
-    clearTimeout(this.idleTimer);
-    this.idleTimer = undefined;
-    const launching = this.pagePromise;
-    const connecting = this.connecting;
-    if (launching) await launching.catch(() => {});
-    if (connecting) await connecting.catch(() => {});
+  private async releaseResources(): Promise<void> {
     await this.closePage();
     if (this.bridgeServer) {
       this.bridgeServer.stop(true);
       this.bridgeServer = null;
     }
+  }
+
+  async dispose(): Promise<void> {
+    this.disposed = true;
+    clearTimeout(this.idleTimer);
+    this.idleTimer = undefined;
+    if (this.idleCleanup) await this.idleCleanup.catch(() => {});
+    const launching = this.pagePromise;
+    const connecting = this.connecting;
+    if (launching) await launching.catch(() => {});
+    if (connecting) await connecting.catch(() => {});
+    await this.releaseResources();
   }
 }
